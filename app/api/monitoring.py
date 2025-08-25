@@ -8,32 +8,32 @@ from typing import Optional
 
 from app.core.database import get_db
 from app.core.cache import redis_cache
+from app.services.portfolio import portfolio_service
 
 router = APIRouter()
 
 
 @router.get("/performance/daily")
-async def get_daily_performance(
-    trade_date: Optional[date] = None,
-    db: Session = Depends(get_db)
-):
+async def get_daily_performance(trade_date: Optional[date] = None):
     """Get daily performance metrics."""
     try:
         if not trade_date:
             trade_date = date.today()
         
-        # TODO: Implement with database models
-        # For now, return cached data
-        performance = redis_cache.get(f"daily_performance:{trade_date}") or {
-            "date": trade_date.isoformat(),
-            "total_trades": 0,
-            "winning_trades": 0,
-            "losing_trades": 0,
-            "total_pnl": 0.0,
-            "win_rate": 0.0,
-            "largest_win": 0.0,
-            "largest_loss": 0.0
-        }
+        performance = portfolio_service.get_daily_performance(trade_date)
+        
+        if not performance:
+            # Return default values if no data exists
+            performance = {
+                "trade_date": trade_date.isoformat(),
+                "total_trades": 0,
+                "winning_trades": 0,
+                "losing_trades": 0,
+                "total_pnl": 0.0,
+                "win_rate": 0.0,
+                "largest_win": 0.0,
+                "largest_loss": 0.0
+            }
         
         performance["timestamp"] = datetime.now().isoformat()
         return performance
@@ -43,20 +43,21 @@ async def get_daily_performance(
 
 
 @router.get("/performance/summary")
-async def get_performance_summary(db: Session = Depends(get_db)):
+async def get_performance_summary(days: int = 30):
     """Get overall performance summary."""
     try:
-        # TODO: Implement with database models
-        summary = redis_cache.get("performance_summary") or {
-            "total_trades": 0,
-            "total_pnl": 0.0,
-            "win_rate": 0.0,
-            "avg_win": 0.0,
-            "avg_loss": 0.0,
-            "profit_factor": 0.0,
-            "max_drawdown": 0.0,
-            "sharpe_ratio": 0.0
-        }
+        summary = portfolio_service.get_performance_summary(days=days)
+        
+        if not summary:
+            summary = {
+                "period_days": days,
+                "total_trades": 0,
+                "total_pnl": 0.0,
+                "win_rate": 0.0,
+                "avg_win": 0.0,
+                "avg_loss": 0.0,
+                "profit_factor": 0.0
+            }
         
         summary["timestamp"] = datetime.now().isoformat()
         return summary
@@ -86,17 +87,30 @@ async def get_recent_logs(limit: int = 50):
 async def get_risk_metrics():
     """Get current risk metrics."""
     try:
-        risk_metrics = redis_cache.get("risk_metrics") or {
-            "current_exposure": 0.0,
-            "max_exposure": 5.0,
-            "daily_pnl": 0.0,
-            "daily_limit": -3000.0,
-            "consecutive_losses": 0,
-            "positions_count": 0
-        }
-        
-        risk_metrics["timestamp"] = datetime.now().isoformat()
+        risk_metrics = portfolio_service.calculate_risk_metrics()
         return risk_metrics
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get risk metrics: {e}")
+
+
+@router.get("/account-summary")
+async def get_account_summary():
+    """Get complete account summary."""
+    try:
+        summary = portfolio_service.get_account_summary()
+        return summary
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get account summary: {e}")
+
+
+@router.get("/risk/check-limits")
+async def check_risk_limits():
+    """Check if any risk limits are violated."""
+    try:
+        risk_check = portfolio_service.check_risk_limits()
+        return risk_check
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to check risk limits: {e}")
