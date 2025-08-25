@@ -69,7 +69,7 @@ def init_db():
     """Initialize database tables."""
     try:
         # Import all models to ensure they are registered
-        from app.models import trade, position, performance  # noqa
+        import app.models  # noqa
         
         # Create all tables
         Base.metadata.create_all(bind=engine)
