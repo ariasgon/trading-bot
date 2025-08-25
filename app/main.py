@@ -11,7 +11,7 @@ from datetime import datetime
 from app.core.config import settings
 from app.core.database import init_db, check_db_connection
 from app.core.cache import redis_cache
-from app.api import trading, monitoring
+from app.api import trading, monitoring, strategy
 
 # Configure logging
 logging.basicConfig(
@@ -117,6 +117,12 @@ app.include_router(
     monitoring.router,
     prefix="/api/v1/monitoring",
     tags=["monitoring"]
+)
+
+app.include_router(
+    strategy.router,
+    prefix="/api/v1/strategy",
+    tags=["strategy"]
 )
 
 

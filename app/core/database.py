@@ -1,7 +1,7 @@
 """
 Database connection and session management.
 """
-from sqlalchemy import create_engine, MetaData
+from sqlalchemy import create_engine, MetaData, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.pool import StaticPool
@@ -84,7 +84,7 @@ def check_db_connection():
     """Check if database connection is working."""
     try:
         with engine.connect() as connection:
-            connection.execute("SELECT 1")
+            connection.execute(text("SELECT 1"))
             logger.info("Database connection successful")
             return True
     except Exception as e:
