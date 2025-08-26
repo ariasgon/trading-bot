@@ -135,12 +135,34 @@ class AnalysisLogger:
         except Exception as e:
             logger.error(f"Error logging position update: {e}")
     
-    def log_trade_entry(self, symbol: str, entry_price: float, shares: int, setup_reasons: List[str]) -> None:
-        """Log new trade entry."""
+    def log_trade_entry(self, symbol: str, entry_price: float, shares: int, setup_reasons: List[str], protective_orders: Dict[str, Any] = None) -> None:
+        """Log new trade entry with protective orders information."""
         try:
             timestamp = datetime.now()
             reasons_str = ', '.join(setup_reasons[:3])  # Top 3 reasons
-            self._add_log('success', f"ENTRY: {shares} shares @ ${entry_price:.2f} - {reasons_str}", symbol, timestamp)
+            
+            # Basic entry log
+            entry_msg = f"ENTRY: {shares} shares @ ${entry_price:.2f} - {reasons_str}"
+            
+            # Add protective orders status
+            if protective_orders:
+                orders_placed = protective_orders.get('orders_placed', 0)
+                if orders_placed > 0:
+                    entry_msg += f" [🛡️ {orders_placed} protective orders placed]"
+                    
+                    # Log stop loss order specifically
+                    if protective_orders.get('stop_loss_order_id'):
+                        self._add_log('success', f"🛡️ Stop-Loss order active at Alpaca (Order: {protective_orders['stop_loss_order_id'][:8]}...)", symbol, timestamp)
+                    
+                    # Log take profit order
+                    if protective_orders.get('take_profit_t1_order_id'):
+                        self._add_log('success', f"🎯 Take-Profit T1 order active at Alpaca", symbol, timestamp)
+                else:
+                    entry_msg += f" [⚠️ NO protective orders placed]"
+                    self._add_log('warning', f"⚠️ RISK: Position has NO protective orders at broker level", symbol, timestamp)
+            
+            self._add_log('success', entry_msg, symbol, timestamp)
+            
         except Exception as e:
             logger.error(f"Error logging trade entry: {e}")
     

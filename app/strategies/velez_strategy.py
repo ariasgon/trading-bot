@@ -262,6 +262,9 @@ class VelezTradingStrategy:
                 # Create trade record
                 trade_id = await self._create_trade_record(setup, order_id, shares)
                 
+                # CRITICAL: Place protective orders at Alpaca immediately for safety
+                protective_orders = await self._place_protective_orders(setup, shares, trade_id)
+                
                 # Remove from active setups
                 self.active_setups.pop(setup.symbol, None)
                 
@@ -277,15 +280,17 @@ class VelezTradingStrategy:
                     risk_reward_ratios=(1.5, 2.5, 4.0)  # T1, T2, T3 targets
                 )
                 
-                # Log trade entry
+                # Log trade entry with protective order info
                 analysis_logger.log_trade_entry(
                     symbol=setup.symbol,
                     entry_price=setup.entry_price,
                     shares=shares,
-                    setup_reasons=setup.setup_reasons
+                    setup_reasons=setup.setup_reasons,
+                    protective_orders=protective_orders
                 )
                 
                 logger.info(f"Successfully entered trade: {setup.symbol} - {shares} shares at ${setup.entry_price}")
+                logger.info(f"Protective orders placed: {protective_orders}")
                 logger.info(f"Created managed position with ID: {managed_position_id}")
                 return trade_id
             else:
@@ -679,6 +684,73 @@ class VelezTradingStrategy:
         except Exception as e:
             logger.error(f"Error placing stop-loss order for {symbol}: {e}")
             return None
+    
+    async def _place_protective_orders(self, setup: TradeSetup, quantity: int, trade_id: str) -> Dict[str, Any]:
+        """
+        Place protective stop-loss and take-profit orders at Alpaca.
+        
+        CRITICAL: This ensures positions are protected even if bot goes offline.
+        """
+        protective_orders = {
+            "stop_loss_order_id": None,
+            "take_profit_t1_order_id": None,
+            "orders_placed": 0,
+            "errors": []
+        }
+        
+        try:
+            # 1. IMMEDIATE Stop-Loss Order (CRITICAL PROTECTION)
+            stop_order_id = order_manager.place_stop_loss_order(
+                symbol=setup.symbol,
+                quantity=quantity,
+                stop_price=setup.stop_loss
+            )
+            
+            if stop_order_id:
+                protective_orders["stop_loss_order_id"] = stop_order_id
+                protective_orders["orders_placed"] += 1
+                logger.info(f"✅ STOP-LOSS placed at Alpaca: {setup.symbol} @ ${setup.stop_loss}")
+            else:
+                error_msg = f"Failed to place stop-loss order for {setup.symbol}"
+                protective_orders["errors"].append(error_msg)
+                logger.error(f"❌ {error_msg}")
+            
+            # 2. Take-Profit T1 Order (30% at 1.5x risk-reward)
+            risk_amount = abs(setup.entry_price - setup.stop_loss)
+            t1_target_price = setup.entry_price + (risk_amount * 1.5)  # 1.5x risk-reward
+            t1_quantity = int(quantity * 0.30)  # 30% position
+            
+            if t1_quantity > 0:
+                t1_order_id = order_manager.place_limit_order(
+                    symbol=setup.symbol,
+                    side='sell',
+                    quantity=t1_quantity,
+                    limit_price=t1_target_price,
+                    trade_id=trade_id
+                )
+                
+                if t1_order_id:
+                    protective_orders["take_profit_t1_order_id"] = t1_order_id
+                    protective_orders["orders_placed"] += 1
+                    logger.info(f"✅ TAKE-PROFIT T1 placed: {setup.symbol} {t1_quantity} shares @ ${t1_target_price:.2f}")
+                else:
+                    error_msg = f"Failed to place T1 take-profit for {setup.symbol}"
+                    protective_orders["errors"].append(error_msg)
+                    logger.warning(f"⚠️ {error_msg}")
+            
+            # 3. Log protective orders summary
+            if protective_orders["orders_placed"] > 0:
+                logger.info(f"🛡️ PROTECTION ACTIVE: {protective_orders['orders_placed']} orders placed for {setup.symbol}")
+            else:
+                logger.error(f"🚨 NO PROTECTION: Failed to place any protective orders for {setup.symbol}")
+            
+            return protective_orders
+            
+        except Exception as e:
+            error_msg = f"Critical error placing protective orders for {setup.symbol}: {e}"
+            protective_orders["errors"].append(error_msg)
+            logger.error(f"🚨 {error_msg}")
+            return protective_orders
     
     def _get_market_session(self) -> MarketSession:
         """Determine current market session."""
