@@ -988,8 +988,17 @@
         // Auto refresh every 30 seconds
         setInterval(forceRefresh, 30000);
         
-        // Auto refresh trading analysis every 5 seconds
-        setInterval(loadTradingAnalysis, 5000);
+        // Auto refresh trading analysis every 5 seconds - only when bot is running
+        setInterval(async () => {
+            try {
+                const statusData = await apiCall('/api/v1/bot/status');
+                if (statusData.bot_status && statusData.bot_status.is_running) {
+                    await loadTradingAnalysis();
+                }
+            } catch (error) {
+                // Silently fail - bot might be stopped
+            }
+        }, 5000);
         
         // Initialize on page load
         document.addEventListener('DOMContentLoaded', function() {
