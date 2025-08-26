@@ -42,24 +42,15 @@ class Position(Base):
     # Risk management
     stop_loss = Column(Numeric(10, 4), nullable=True)
     target_price = Column(Numeric(10, 4), nullable=True)
-    trail_stop_amount = Column(Numeric(10, 4), nullable=True)  # Trailing stop distance
     
     # P&L tracking
     unrealized_pnl = Column(Numeric(15, 2), default=0.0)
-    unrealized_pnl_percent = Column(Numeric(8, 4), default=0.0)
     
     # Position management
     status = Column(Enum(PositionStatus), nullable=False, default=PositionStatus.OPEN, index=True)
-    partial_fills = Column(Integer, default=0)  # Number of partial fills
     
     # References
     trade_id = Column(UUID(as_uuid=True), ForeignKey("trades.id"), nullable=True)
-    alpaca_position_id = Column(String(50), nullable=True)  # Alpaca's position ID
-    
-    # Strategy information
-    strategy = Column(String(50), default="velez")
-    setup_type = Column(String(50), nullable=True)
-    confidence_level = Column(String(20), nullable=True)  # high, medium, low
     
     # Timing
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -112,10 +103,6 @@ class Position(Base):
             pnl = (entry_price - current_price) * abs(self.quantity)
         
         self.unrealized_pnl = pnl
-        
-        # Calculate percentage
-        if self.cost_basis > 0:
-            self.unrealized_pnl_percent = (pnl / self.cost_basis) * 100
     
     def update_trailing_stop(self, atr_value: float = None, fixed_amount: float = None):
         """Update trailing stop based on current price."""
@@ -130,9 +117,6 @@ class Position(Base):
         elif fixed_amount:
             # Use fixed amount
             trail_amount = fixed_amount
-        elif self.trail_stop_amount:
-            # Use existing trail amount
-            trail_amount = float(self.trail_stop_amount)
         else:
             return
         

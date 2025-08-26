@@ -260,7 +260,7 @@ class RiskManagerService:
         """Get the number of currently open positions."""
         try:
             with get_db_session() as db:
-                count = db.query(Position).filter(Position.status == PositionStatus.OPEN).count()
+                count = db.query(Position).filter(Position.status == 'open').count()
                 return count
         except Exception as e:
             logger.error(f"Error getting open positions count: {e}")
@@ -272,7 +272,7 @@ class RiskManagerService:
             with get_db_session() as db:
                 position = db.query(Position).filter(
                     Position.symbol == symbol.upper(),
-                    Position.status == PositionStatus.OPEN
+                    Position.status == 'open'
                 ).first()
                 
                 if position:
@@ -366,7 +366,7 @@ class RiskManagerService:
         """Monitor all open positions for risk management."""
         try:
             with get_db_session() as db:
-                positions = db.query(Position).filter(Position.status == PositionStatus.OPEN).all()
+                positions = db.query(Position).filter(Position.status == 'open').all()
                 
                 risk_alerts = []
                 total_risk = 0

@@ -208,8 +208,8 @@ class MarketDataService:
             # Map timeframe string to Alpaca TimeFrame
             timeframe_map = {
                 "1T": TimeFrame.Minute,
-                "5T": TimeFrame(5, TimeFrame.Unit.Minute),
-                "15T": TimeFrame(15, TimeFrame.Unit.Minute),
+                "5T": TimeFrame(5, TimeFrame.Minute),
+                "15T": TimeFrame(15, TimeFrame.Minute),
                 "1H": TimeFrame.Hour,
                 "1D": TimeFrame.Day
             }

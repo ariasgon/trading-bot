@@ -62,12 +62,15 @@ class PortfolioService:
             return {}
     
     def get_open_positions(self) -> List[Dict[str, Any]]:
-        """Get all open positions."""
+        """Get all open positions from both database and Alpaca."""
         try:
+            position_list = []
+            
+            # First get positions from database
             with get_db_session() as db:
-                positions = db.query(Position).filter(Position.status == PositionStatus.OPEN).all()
+                # Use raw string to avoid enum issue temporarily
+                positions = db.query(Position).filter(Position.status == 'open').all()
                 
-                position_list = []
                 for pos in positions:
                     # Update current price
                     current_price = market_data_service.get_current_price(pos.symbol)
@@ -90,12 +93,44 @@ class PortfolioService:
                         "cost_basis": pos.cost_basis,
                         "strategy": pos.strategy,
                         "setup_type": pos.setup_type,
-                        "created_at": pos.created_at.isoformat()
+                        "created_at": pos.created_at.isoformat(),
+                        "source": "database"
                     }
                     
                     position_list.append(position_data)
-                
-                return position_list
+            
+            # Also get positions directly from Alpaca (for positions not tracked in database)
+            alpaca_positions = order_manager.get_positions()
+            
+            # Get symbols already in database to avoid duplicates
+            db_symbols = {pos['symbol'] for pos in position_list}
+            
+            # Add Alpaca positions that aren't in database
+            for alpaca_pos in alpaca_positions:
+                symbol = alpaca_pos['symbol']
+                if symbol not in db_symbols:
+                    position_data = {
+                        "id": f"alpaca_{symbol}",
+                        "symbol": symbol,
+                        "quantity": alpaca_pos['quantity'],
+                        "side": alpaca_pos['side'],
+                        "entry_price": alpaca_pos['avg_entry_price'],
+                        "current_price": alpaca_pos['current_price'],
+                        "stop_loss": None,
+                        "target_price": None,
+                        "unrealized_pnl": alpaca_pos['unrealized_pnl'],
+                        "unrealized_pnl_percent": alpaca_pos['unrealized_pnl_percent'],
+                        "market_value": alpaca_pos['market_value'],
+                        "cost_basis": alpaca_pos['cost_basis'],
+                        "strategy": "manual",
+                        "setup_type": "manual",
+                        "created_at": datetime.now().isoformat(),
+                        "source": "alpaca"
+                    }
+                    
+                    position_list.append(position_data)
+            
+            return position_list
                 
         except Exception as e:
             logger.error(f"Error getting open positions: {e}")
@@ -395,9 +430,11 @@ class PortfolioService:
     def health_check(self) -> bool:
         """Check if portfolio service is healthy."""
         try:
-            # Test database connection by querying positions
-            positions = self.get_open_positions()
-            return isinstance(positions, list)
+            # Simple database connection test
+            with get_db_session() as db:
+                # Just test that we can connect and count positions
+                count = db.query(Position).count()
+                return True
             
         except Exception as e:
             logger.error(f"Portfolio service health check failed: {e}")

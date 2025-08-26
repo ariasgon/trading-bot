@@ -17,6 +17,9 @@ from dataclasses import dataclass
 from enum import Enum
 
 from app.strategies.indicators import VelezSignalGenerator, TechnicalIndicators
+from app.strategies.ov_core_signals import OVCoreSignals
+from app.strategies.ov_position_manager import ov_position_manager
+from app.services.analysis_logger import analysis_logger
 from app.services.market_data import market_data_service
 from app.services.order_manager import order_manager
 from app.services.risk_manager import risk_manager
@@ -68,10 +71,11 @@ class VelezTradingStrategy:
     def __init__(self):
         self.signal_generator = VelezSignalGenerator()
         self.indicators = TechnicalIndicators()
+        self.ov_signals = OVCoreSignals()
         self.is_active = False
         self.active_setups = {}
         self.daily_trades_count = 0
-        self.max_daily_trades = 10
+        self.max_daily_trades = 50  # Increased from 10 for automated trading
         
         # Strategy parameters
         self.min_gap_percent = 0.75
@@ -264,10 +268,25 @@ class VelezTradingStrategy:
                 # Update daily trade count
                 self.daily_trades_count += 1
                 
-                # Place stop-loss order
-                await self._place_stop_loss_order(setup.symbol, shares, setup.stop_loss)
+                # Create OV managed position with 3-stage scaling
+                managed_position_id = await ov_position_manager.create_managed_position(
+                    symbol=setup.symbol,
+                    entry_price=setup.entry_price,
+                    stop_loss=setup.stop_loss,
+                    quantity=shares,
+                    risk_reward_ratios=(1.5, 2.5, 4.0)  # T1, T2, T3 targets
+                )
+                
+                # Log trade entry
+                analysis_logger.log_trade_entry(
+                    symbol=setup.symbol,
+                    entry_price=setup.entry_price,
+                    shares=shares,
+                    setup_reasons=setup.setup_reasons
+                )
                 
                 logger.info(f"Successfully entered trade: {setup.symbol} - {shares} shares at ${setup.entry_price}")
+                logger.info(f"Created managed position with ID: {managed_position_id}")
                 return trade_id
             else:
                 logger.error(f"Failed to place order for {setup.symbol}")
@@ -279,20 +298,51 @@ class VelezTradingStrategy:
     
     async def manage_open_positions(self) -> List[Dict[str, Any]]:
         """
-        Manage open positions for exits and stops.
+        Manage open positions using OV advanced position management.
         
         Returns:
             List of position management actions taken
         """
         try:
             actions = []
+            
+            # Get all managed positions from OV position manager
+            managed_positions = ov_position_manager.get_all_managed_positions()
+            
+            for symbol, position_data in managed_positions.items():
+                if "error" in position_data:
+                    continue
+                    
+                try:
+                    # Update position management for each symbol
+                    update_result = await ov_position_manager.update_position_management(symbol)
+                    
+                    if "error" not in update_result:
+                        # Add any actions taken
+                        actions_taken = update_result.get('actions_taken', [])
+                        actions.extend(actions_taken)
+                        
+                        # Log significant updates
+                        if actions_taken:
+                            logger.info(f"Position management update for {symbol}: {len(actions_taken)} actions taken")
+                            
+                except Exception as e:
+                    logger.error(f"Error updating managed position {symbol}: {e}")
+                    continue
+            
+            # Also handle any non-managed positions (fallback to old system)
             open_positions = portfolio_service.get_open_positions()
+            managed_symbols = set(managed_positions.keys())
             
             for position in open_positions:
                 try:
                     symbol = position['symbol']
                     
-                    # Get current market data
+                    # Skip if already managed by OV system
+                    if symbol in managed_symbols:
+                        continue
+                    
+                    # Use legacy management for non-OV positions
                     df = await self._get_market_data(symbol, period='1d', interval='1m')
                     if df is None or df.empty:
                         continue
@@ -310,7 +360,7 @@ class VelezTradingStrategy:
                             actions.append(action)
                             
                 except Exception as e:
-                    logger.error(f"Error managing position {symbol}: {e}")
+                    logger.error(f"Error managing legacy position {symbol}: {e}")
                     continue
             
             return actions
@@ -365,25 +415,52 @@ class VelezTradingStrategy:
                                df: pd.DataFrame) -> Optional[TradeSetup]:
         """Create a trade setup from gap analysis."""
         try:
-            # Run full technical analysis
+            # Run full technical analysis with OV signals
             analysis = self.signal_generator.analyze_stock(df, symbol)
+            ov_analysis = self.ov_signals.analyze_comprehensive(df, symbol)
             
-            if analysis.get('signal_strength', 0) < self.min_signal_strength:
+            # Log OV analysis results
+            analysis_logger.log_ov_analysis(symbol, ov_analysis)
+            
+            # Combine traditional and OV signal strengths
+            traditional_strength = analysis.get('signal_strength', 0)
+            ov_max_score = ov_analysis.get('max_score', 0)
+            combined_strength = traditional_strength + (ov_max_score * 0.5)  # Weight OV signals
+            
+            if combined_strength < self.min_signal_strength:
                 return None
             
             # Calculate confidence score
             confidence_score = self._calculate_confidence_score(gap_analysis, analysis)
             
+            # Add OV-specific reasons to setup
+            ov_reasons = []
+            if ov_analysis.get('strongest_signals'):
+                for signal in ov_analysis['strongest_signals'][:2]:  # Top 2 OV signals
+                    if signal.get('bt_tt', {}).get('is_bt'):
+                        ov_reasons.append("OV Bottom Tail (BT) reversal")
+                    if signal.get('bt_tt', {}).get('is_tt'):
+                        ov_reasons.append("OV Top Tail (TT) reversal")
+                    if signal.get('elephant', {}).get('is_elephant'):
+                        elephant_type = signal['elephant'].get('type', 'unknown')
+                        ov_reasons.append(f"OV Elephant ({elephant_type})")
+                    if signal.get('reversal_3_5', {}).get('is_reversal'):
+                        ov_reasons.append("OV 3-5 Bar Exhaustion Reversal")
+                    if signal.get('nrb_nbb', {}).get('breakout_probability') == 'high':
+                        ov_reasons.append("OV NRB/NBB Breakout Setup")
+            
+            combined_reasons = analysis.get('signal_reasons', []) + ov_reasons
+
             setup = TradeSetup(
                 symbol=symbol,
                 signal_type=analysis.get('signal', 'none'),
-                signal_strength=analysis.get('signal_strength', 0),
+                signal_strength=int(combined_strength),
                 entry_price=analysis.get('entry_price', 0),
                 stop_loss=analysis.get('stop_loss', 0),
                 target_price=analysis.get('target_price', 0),
                 position_size=0,  # Will be calculated at execution
                 risk_reward_ratio=analysis.get('risk_reward_ratio', 0),
-                setup_reasons=analysis.get('signal_reasons', []),
+                setup_reasons=combined_reasons,
                 timestamp=datetime.now(),
                 confidence_score=confidence_score
             )
@@ -606,7 +683,10 @@ class VelezTradingStrategy:
     def _get_market_session(self) -> MarketSession:
         """Determine current market session."""
         try:
-            now = datetime.now().time()
+            import pytz
+            # Get current Eastern Time
+            est = pytz.timezone('US/Eastern')
+            now_est = datetime.now(est).time()
             
             # Market hours (Eastern Time)
             pre_market_start = time(4, 0)
@@ -614,11 +694,11 @@ class VelezTradingStrategy:
             market_close = time(16, 0)
             after_hours_end = time(20, 0)
             
-            if pre_market_start <= now < market_open:
+            if pre_market_start <= now_est < market_open:
                 return MarketSession.PRE_MARKET
-            elif market_open <= now < market_close:
+            elif market_open <= now_est < market_close:
                 return MarketSession.REGULAR_HOURS
-            elif market_close <= now < after_hours_end:
+            elif market_close <= now_est < after_hours_end:
                 return MarketSession.AFTER_HOURS
             else:
                 return MarketSession.CLOSED
@@ -681,10 +761,38 @@ class VelezTradingStrategy:
             logger.error(f"Error getting strategy status: {e}")
             return {'is_active': False, 'error': str(e)}
     
+    async def end_of_day_cleanup(self) -> Dict[str, Any]:
+        """Execute end-of-day cleanup procedures."""
+        try:
+            logger.info("Starting end-of-day cleanup...")
+            
+            # Close all managed positions
+            ov_actions = await ov_position_manager.end_of_day_cleanup()
+            
+            # Reset daily counters
+            self.daily_trades_count = 0
+            self.active_setups = {}
+            
+            cleanup_summary = {
+                "ov_positions_closed": len(ov_actions),
+                "cleanup_actions": ov_actions,
+                "cleanup_time": datetime.now().isoformat()
+            }
+            
+            logger.info(f"End-of-day cleanup complete: {len(ov_actions)} positions closed")
+            return cleanup_summary
+            
+        except Exception as e:
+            logger.error(f"Error in end-of-day cleanup: {e}")
+            return {"error": str(e)}
+    
     async def shutdown_strategy(self) -> bool:
         """Shutdown the strategy gracefully."""
         try:
             logger.info("Shutting down Velez trading strategy...")
+            
+            # Perform end-of-day cleanup
+            await self.end_of_day_cleanup()
             
             self.is_active = False
             self.active_setups = {}

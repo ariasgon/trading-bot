@@ -5,13 +5,14 @@ import logging
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
 from datetime import datetime
 
 from app.core.config import settings
 from app.core.database import init_db, check_db_connection
 from app.core.cache import redis_cache
-from app.api import trading, monitoring, strategy
+from app.api import trading, monitoring, strategy, bot_control, test_ov
 
 # Configure logging
 logging.basicConfig(
@@ -124,6 +125,35 @@ app.include_router(
     prefix="/api/v1/strategy",
     tags=["strategy"]
 )
+
+app.include_router(
+    bot_control.router,
+    prefix="/api/v1/bot",
+    tags=["bot_control"]
+)
+
+app.include_router(
+    test_ov.router,
+    prefix="/api/v1/test-ov",
+    tags=["test_ov"]
+)
+
+# Crypto API router - DISABLED for stock trading only
+# try:
+#     from app.api import crypto_api
+#     app.include_router(
+#         crypto_api.router,
+#         prefix="/api/v1/crypto",
+#         tags=["crypto"]
+#     )
+#     logger.info("Crypto API routes loaded successfully")
+# except ImportError as e:
+#     logger.warning(f"Crypto API not available: {e}")
+# except Exception as e:
+#     logger.error(f"Failed to load crypto API: {e}")
+
+# Mount static files
+app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
 
 if __name__ == "__main__":

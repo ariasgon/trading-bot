@@ -10,7 +10,7 @@ from app.models.position import Position, PositionStatus
 from app.models.performance import DailyPerformance, TradingSession
 from app.models.market_data import MarketData, PreMarketData
 
-# Export all models
+# Export stock models only
 __all__ = [
     "Trade",
     "TradeSide", 

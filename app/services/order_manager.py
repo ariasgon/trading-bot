@@ -354,7 +354,7 @@ class OrderManagerService:
                                 trade.update_exit(fill_price, datetime.now())
                 
                 # Update or create position record
-                position = db.query(Position).filter(Position.symbol == symbol, Position.status == PositionStatus.OPEN).first()
+                position = db.query(Position).filter(Position.symbol == symbol, Position.status == 'open').first()
                 
                 if side == 'buy':
                     if position:
@@ -411,16 +411,41 @@ class OrderManagerService:
             
             position_list = []
             for pos in positions:
+                # Safely get attributes with defaults
+                qty = int(pos.qty) if hasattr(pos, 'qty') else 0
+                market_value = float(pos.market_value) if hasattr(pos, 'market_value') else 0.0
+                cost_basis = float(pos.cost_basis) if hasattr(pos, 'cost_basis') else 0.0
+                current_price = float(pos.current_price) if hasattr(pos, 'current_price') else 0.0
+                avg_entry_price = float(pos.avg_entry_price) if hasattr(pos, 'avg_entry_price') else 0.0
+                
+                # Calculate unrealized P&L if not available
+                unrealized_pnl = 0.0
+                unrealized_pnl_percent = 0.0
+                
+                if hasattr(pos, 'unrealized_pnl'):
+                    unrealized_pnl = float(pos.unrealized_pnl)
+                elif hasattr(pos, 'unrealized_pl'):  # Alternative attribute name
+                    unrealized_pnl = float(pos.unrealized_pl)
+                else:
+                    # Calculate manually
+                    if qty != 0 and avg_entry_price > 0:
+                        unrealized_pnl = qty * (current_price - avg_entry_price)
+                
+                if hasattr(pos, 'unrealized_plpc'):
+                    unrealized_pnl_percent = float(pos.unrealized_plpc) * 100
+                elif avg_entry_price > 0:
+                    unrealized_pnl_percent = ((current_price - avg_entry_price) / avg_entry_price) * 100
+                
                 position_data = {
                     "symbol": pos.symbol,
-                    "quantity": int(pos.qty),
-                    "side": "long" if int(pos.qty) > 0 else "short",
-                    "market_value": float(pos.market_value),
-                    "cost_basis": float(pos.cost_basis),
-                    "unrealized_pnl": float(pos.unrealized_pnl),
-                    "unrealized_pnl_percent": float(pos.unrealized_plpc) * 100,
-                    "current_price": float(pos.current_price),
-                    "avg_entry_price": float(pos.avg_entry_price)
+                    "quantity": qty,
+                    "side": "long" if qty > 0 else "short",
+                    "market_value": market_value,
+                    "cost_basis": cost_basis,
+                    "unrealized_pnl": unrealized_pnl,
+                    "unrealized_pnl_percent": unrealized_pnl_percent,
+                    "current_price": current_price,
+                    "avg_entry_price": avg_entry_price
                 }
                 position_list.append(position_data)
             

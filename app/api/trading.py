@@ -13,6 +13,7 @@ from app.services.portfolio import portfolio_service
 from app.services.market_data import market_data_service
 from app.services.order_manager import order_manager
 from app.services.risk_manager import risk_manager
+from app.strategies.ov_position_manager import ov_position_manager
 
 
 class OrderRequest(BaseModel):
@@ -260,3 +261,74 @@ async def check_pre_trade_conditions():
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to check conditions: {e}")
+
+
+@router.get("/ov-positions")
+async def get_ov_managed_positions():
+    """Get all Oliver Velez managed positions with detailed status."""
+    try:
+        managed_positions = ov_position_manager.get_all_managed_positions()
+        
+        return {
+            "managed_positions": managed_positions,
+            "count": len(managed_positions),
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get OV positions: {e}")
+
+
+@router.get("/ov-positions/{symbol}")
+async def get_ov_position_detail(symbol: str):
+    """Get detailed status of a specific OV managed position."""
+    try:
+        position_status = ov_position_manager.get_position_status(symbol.upper())
+        return position_status
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get OV position for {symbol}: {e}")
+
+
+@router.post("/ov-positions/{symbol}/force-close")
+async def force_close_ov_position(symbol: str):
+    """Force close an OV managed position."""
+    try:
+        result = await ov_position_manager.force_close_position(symbol.upper(), "manual_close")
+        
+        if result and "error" not in result:
+            return {
+                "message": f"Successfully force closed position for {symbol}",
+                "result": result,
+                "timestamp": datetime.now().isoformat()
+            }
+        else:
+            raise HTTPException(status_code=400, detail=result.get("error", "Failed to close position"))
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to force close position: {e}")
+
+
+@router.post("/risk-management/daily-cleanup")
+async def execute_daily_risk_cleanup():
+    """Execute end-of-day risk management cleanup."""
+    try:
+        # Close all OV managed positions
+        ov_cleanup = await ov_position_manager.end_of_day_cleanup()
+        
+        # Check risk limits one final time
+        risk_check = risk_manager.monitor_positions_risk()
+        
+        return {
+            "cleanup_summary": {
+                "ov_positions_closed": len(ov_cleanup),
+                "positions_closed": ov_cleanup,
+                "risk_alerts": risk_check.get("risk_alerts", []),
+                "cleanup_time": datetime.now().isoformat()
+            }
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to execute daily cleanup: {e}")
