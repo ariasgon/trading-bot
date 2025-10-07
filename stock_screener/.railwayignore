@@ -16,3 +16,6 @@ test_*.py
 .git/
 .vscode/
 .idea/
+venv/
+env/
+ENV/

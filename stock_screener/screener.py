@@ -39,19 +39,21 @@ class StockScreener:
         self.alpaca_secret = os.getenv('ALPACA_SECRET_KEY')
         self.fmp_key = os.getenv('FMP_API_KEY')
 
-        # Email config
+        # Notification config
+        self.pabbly_webhook_url = os.getenv('PABBLY_WEBHOOK_URL')
         self.email_from = os.getenv('EMAIL_FROM')
         self.email_to = os.getenv('EMAIL_TO')
         self.email_password = os.getenv('EMAIL_PASSWORD')  # For SMTP fallback
         self.sendgrid_api_key = os.getenv('SENDGRID_API_KEY')
 
-        # Check if email is configured (prefer SendGrid, fallback to SMTP)
+        # Check notification methods (prefer Pabbly webhook, then SendGrid, then SMTP)
+        self.use_pabbly = bool(self.pabbly_webhook_url)
         self.use_sendgrid = bool(self.sendgrid_api_key and self.email_from and self.email_to)
         self.use_smtp = bool(self.email_from and self.email_to and self.email_password)
-        self.email_configured = self.use_sendgrid or self.use_smtp
+        self.notification_configured = self.use_pabbly or self.use_sendgrid or self.use_smtp
 
-        if not self.email_configured:
-            print("WARNING: Email not configured. Set SENDGRID_API_KEY (recommended) or EMAIL_FROM, EMAIL_TO, EMAIL_PASSWORD")
+        if not self.notification_configured:
+            print("WARNING: No notification method configured. Set PABBLY_WEBHOOK_URL (recommended), SENDGRID_API_KEY, or EMAIL_FROM/EMAIL_TO/EMAIL_PASSWORD")
 
         # API endpoints
         self.alpaca_data = "https://data.alpaca.markets"
@@ -279,16 +281,61 @@ class StockScreener:
         for alert in alerts:
             print(f"{alert.ticker}: {alert.drop_pct}% (${alert.current_price} vs ATH ${alert.ath_5y})")
 
+    def send_to_pabbly(self, alerts: List[StockAlert]) -> bool:
+        """Send alerts to Pabbly webhook"""
+        try:
+            print(f"Sending {len(alerts)} alerts to Pabbly webhook...")
+
+            # Format data for Pabbly
+            payload = {
+                "date": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                "alert_count": len(alerts),
+                "subject": f"Stock Alert: {len(alerts)} Stocks Down 30%+ from ATH",
+                "alerts": [
+                    {
+                        "ticker": alert.ticker,
+                        "current_price": round(alert.current_price, 2),
+                        "ath_5y": round(alert.ath_5y, 2),
+                        "drop_pct": round(alert.drop_pct, 1),
+                        "ath_date": alert.ath_date
+                    }
+                    for alert in alerts
+                ]
+            }
+
+            # Send to Pabbly webhook
+            response = requests.post(
+                self.pabbly_webhook_url,
+                json=payload,
+                timeout=30
+            )
+            response.raise_for_status()
+
+            print(f"Successfully sent to Pabbly (status: {response.status_code})")
+            return True
+
+        except Exception as e:
+            print(f"Pabbly webhook failed: {e}")
+            return False
+
     def send_email(self, alerts: List[StockAlert]):
-        """Send email alert using SendGrid API (preferred) or SMTP fallback"""
-        if not self.email_configured:
-            print("Email not configured - skipping email")
+        """Send alert using Pabbly webhook (preferred), SendGrid API, or SMTP fallback"""
+        if not self.notification_configured:
+            print("No notification method configured - skipping")
             return
+
+        # Try Pabbly webhook first (works on Railway, no email setup needed)
+        if self.use_pabbly:
+            if self.send_to_pabbly(alerts):
+                return  # Success! Pabbly will handle email delivery
+            elif not (self.use_sendgrid or self.use_smtp):
+                print("No email fallback configured. Notification not sent.")
+                return
 
         subject = f"Stock Alert: {len(alerts)} Stocks Down 30%+ from ATH - {datetime.now().strftime('%Y-%m-%d')}"
         html_content = self.create_email_html(alerts)
 
-        # Try SendGrid first (works reliably on Railway)
+        # Try SendGrid if Pabbly failed or not configured
         if self.use_sendgrid:
             try:
                 print("Sending email via SendGrid API...")
@@ -308,7 +355,7 @@ class StockScreener:
                     print("No SMTP fallback configured. Email not sent.")
                     return
 
-        # Fallback to SMTP if SendGrid fails or not configured
+        # Fallback to SMTP if everything else fails
         if self.use_smtp:
             msg = MIMEMultipart('alternative')
             msg['Subject'] = subject
@@ -338,7 +385,7 @@ class StockScreener:
                 except Exception as e:
                     print(f"{method_name} failed: {e}")
 
-            print("All email methods failed. Email not sent.")
+            print("All notification methods failed.")
 
     def run(self):
         """Main execution"""
