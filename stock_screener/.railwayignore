@@ -1,0 +1,18 @@
+# Don't upload these to Railway
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.env.example
+test_*.py
+*_simple.py
+*.md
+.git/
+.vscode/
+.idea/

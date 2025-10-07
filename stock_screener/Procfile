@@ -1,0 +1,2 @@
+# For Railway/Heroku deployment
+worker: python screener.py
