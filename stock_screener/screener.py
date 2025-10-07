@@ -115,6 +115,9 @@ class StockScreener:
         # Combine and deduplicate
         all_symbols = sorted(list(set(nasdaq_100 + sp500_nyse + penny_stocks)))
 
+        # Store penny stocks list for filtering later
+        self.penny_stocks = set(penny_stocks)
+
         print(f"Loaded {len(all_symbols)} stocks:")
         print(f"  - NASDAQ-100: {len(nasdaq_100)} stocks")
         print(f"  - S&P 500 (NYSE): {len(sp500_nyse)} stocks")
@@ -185,6 +188,11 @@ class StockScreener:
 
                 # Filter: Only stocks down 30% or more
                 if drop_pct <= -30:
+                    # Skip penny stocks that are down more than 50%
+                    if symbol in self.penny_stocks and drop_pct <= -50:
+                        print(f"SKIPPED (penny stock >50% drop): {symbol}: {drop_pct:.1f}% from ATH")
+                        continue
+
                     # Calculate price CAGR (5 years)
                     price_5y_ago = df['c'].iloc[0]
                     price_cagr_5y = self.calculate_cagr(price_5y_ago, current_price, 5)
@@ -296,9 +304,9 @@ class StockScreener:
     <style>
         body {{ font-family: 'Segoe UI', Arial, sans-serif; background-color: #f5f7fa; margin: 0; padding: 20px; }}
         .container {{ max-width: 900px; margin: 0 auto; background: #ffffff; border-radius: 10px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
-        .header {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px 20px; text-align: center; }}
-        .header h1 {{ margin: 0 0 10px 0; font-size: 28px; font-weight: 600; }}
-        .header p {{ margin: 0; font-size: 16px; opacity: 0.95; }}
+        .header {{ background: #f8f9fc; padding: 30px 20px; text-align: center; border-bottom: 3px solid #667eea; }}
+        .header h1 {{ margin: 0 0 10px 0; font-size: 28px; font-weight: 600; color: #000000; }}
+        .header p {{ margin: 0; font-size: 16px; color: #000000; }}
         .summary {{ background-color: #f8f9fc; padding: 20px; margin: 20px; border-left: 5px solid #667eea; border-radius: 5px; }}
         .summary-item {{ margin: 8px 0; font-size: 15px; color: #333; }}
         .summary-item strong {{ color: #667eea; font-weight: 600; }}

@@ -18,8 +18,9 @@ sample_html = """<!DOCTYPE html>
     <style>
         body { font-family: Arial, sans-serif; background: #f5f7fa; margin: 0; padding: 20px; }
         .container { max-width: 900px; margin: 0 auto; background: white; border-radius: 10px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
-        .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px 20px; text-align: center; }
-        .header h1 { margin: 0; font-size: 28px; }
+        .header { background: #f8f9fc; padding: 30px 20px; text-align: center; border-bottom: 3px solid #667eea; }
+        .header h1 { margin: 0 0 10px 0; font-size: 28px; color: #000000; }
+        .header p { margin: 0; font-size: 16px; color: #000000; }
         .summary { background: #f8f9fc; padding: 20px; margin: 20px; border-left: 5px solid #667eea; border-radius: 5px; }
         .badge { background: #dc3545; color: white; padding: 5px 15px; border-radius: 20px; font-weight: bold; }
         table { width: 100%; border-collapse: collapse; margin: 20px; font-size: 14px; }
