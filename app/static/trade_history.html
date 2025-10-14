@@ -576,34 +576,40 @@
                 });
             }
 
-            const totalPnl = summary.total_pnl + unrealizedPnl;
+            const totalPnl = (summary.total_pnl || 0) + unrealizedPnl;
 
             // Total P/L (Realized + Unrealized)
             const pnlEl = document.getElementById('total-pnl');
             pnlEl.textContent = `$${totalPnl.toFixed(2)}`;
             pnlEl.className = `stat-value ${totalPnl >= 0 ? 'positive' : 'negative'}`;
 
-            // Stats
-            document.getElementById('total-trades').textContent = summary.total_trades;
-            document.getElementById('win-rate').textContent = `${summary.win_rate.toFixed(1)}%`;
-            document.getElementById('winners').textContent = summary.winning_trades;
-            document.getElementById('losers').textContent = summary.losing_trades;
-            document.getElementById('avg-winner').textContent = `$${summary.average_winner.toFixed(2)}`;
-            document.getElementById('avg-loser').textContent = `$${summary.average_loser.toFixed(2)}`;
+            // Stats with defaults for when there are no trades
+            document.getElementById('total-trades').textContent = summary.total_trades || 0;
+            document.getElementById('win-rate').textContent = `${(summary.win_rate || 0).toFixed(1)}%`;
+            document.getElementById('winners').textContent = summary.winning_trades || 0;
+            document.getElementById('losers').textContent = summary.losing_trades || 0;
+            document.getElementById('avg-winner').textContent = `$${(summary.average_winner || 0).toFixed(2)}`;
+            document.getElementById('avg-loser').textContent = `$${(summary.average_loser || 0).toFixed(2)}`;
 
             // Best/Worst
             if (data.best_trade) {
                 document.getElementById('best-trade').textContent = `$${data.best_trade.pnl.toFixed(2)}`;
                 document.getElementById('best-symbol').textContent = data.best_trade.symbol;
+            } else {
+                document.getElementById('best-trade').textContent = '$0.00';
+                document.getElementById('best-symbol').textContent = 'N/A';
             }
             if (data.worst_trade) {
                 document.getElementById('worst-trade').textContent = `$${data.worst_trade.pnl.toFixed(2)}`;
                 document.getElementById('worst-symbol').textContent = data.worst_trade.symbol;
+            } else {
+                document.getElementById('worst-trade').textContent = '$0.00';
+                document.getElementById('worst-symbol').textContent = 'N/A';
             }
 
-            // Risk
-            document.getElementById('avg-r-multiple').textContent = `${summary.average_r_multiple.toFixed(2)}R`;
-            document.getElementById('profit-factor').textContent = summary.profit_factor.toFixed(2);
+            // Risk with defaults
+            document.getElementById('avg-r-multiple').textContent = `${(summary.average_r_multiple || 0).toFixed(2)}R`;
+            document.getElementById('profit-factor').textContent = (summary.profit_factor || 0).toFixed(2);
         }
 
         function displayTrades(trades) {
