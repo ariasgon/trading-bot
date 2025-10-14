@@ -410,12 +410,35 @@
 
         <!-- Tabs -->
         <div class="tabs" style="display: none;" id="tabs-section">
-            <button class="tab active" onclick="showTab('trades')">Closed Trades</button>
+            <button class="tab active" onclick="showTab('positions')">Open Positions</button>
+            <button class="tab" onclick="showTab('trades')">Closed Trades</button>
             <button class="tab" onclick="showTab('orders')">Recent Orders</button>
         </div>
 
+        <!-- Open Positions Table -->
+        <div id="positions-tab" class="tab-content active">
+            <table id="positions-table" style="display: none;">
+                <thead>
+                    <tr>
+                        <th>Symbol</th>
+                        <th>Side</th>
+                        <th>Quantity</th>
+                        <th>Entry Price</th>
+                        <th>Current Price</th>
+                        <th>Market Value</th>
+                        <th>Unrealized P/L</th>
+                        <th>P/L %</th>
+                        <th>Stop Loss</th>
+                        <th>Target</th>
+                    </tr>
+                </thead>
+                <tbody id="positions-tbody">
+                </tbody>
+            </table>
+        </div>
+
         <!-- Trade History Table -->
-        <div id="trades-tab" class="tab-content active">
+        <div id="trades-tab" class="tab-content">
             <table id="trades-table" style="display: none;">
                 <thead>
                     <tr>
@@ -467,11 +490,17 @@
 
         async function loadData() {
             try {
+                // Load active positions
+                const positionsResponse = await fetch(`/api/v1/bot/active-positions`);
+                if (!positionsResponse.ok) throw new Error('Failed to load positions');
+                const positionsData = await positionsResponse.json();
+                displayPositions(positionsData.active_positions);
+
                 // Load analytics summary
                 const summaryResponse = await fetch(`/api/v1/history/analytics/summary?days=${currentFilters.days}`);
                 if (!summaryResponse.ok) throw new Error('Failed to load analytics');
                 const summaryData = await summaryResponse.json();
-                displaySummary(summaryData);
+                displaySummary(summaryData, positionsData);
 
                 // Load trades
                 const tradesResponse = await fetch(`/api/v1/history/trades?limit=100`);
@@ -490,6 +519,7 @@
                 document.getElementById('summary-dashboard').style.display = 'grid';
                 document.getElementById('filters-section').style.display = 'block';
                 document.getElementById('tabs-section').style.display = 'flex';
+                document.getElementById('positions-table').style.display = 'table';
                 document.getElementById('trades-table').style.display = 'table';
                 document.getElementById('orders-table').style.display = 'table';
             } catch (error) {
@@ -500,15 +530,58 @@
             }
         }
 
-        function displaySummary(data) {
+        function displayPositions(positions) {
+            const tbody = document.getElementById('positions-tbody');
+            tbody.innerHTML = '';
+
+            if (!positions || Object.keys(positions).length === 0) {
+                tbody.innerHTML = '<tr><td colspan="10" style="text-align: center; padding: 30px; color: #666;">No open positions</td></tr>';
+                return;
+            }
+
+            Object.values(positions).forEach(pos => {
+                const row = document.createElement('tr');
+
+                const pnl = pos.unrealized_pl || 0;
+                const pnlClass = pnl >= 0 ? 'winner' : 'loser';
+                const pnlPct = pos.unrealized_plpc || 0;
+
+                row.innerHTML = `
+                    <td><strong>${pos.symbol}</strong></td>
+                    <td><span class="badge badge-${pos.side}">${pos.side}</span></td>
+                    <td>${pos.quantity}</td>
+                    <td>$${(pos.entry_price || 0).toFixed(2)}</td>
+                    <td>$${(pos.current_price || 0).toFixed(2)}</td>
+                    <td>$${(pos.market_value || 0).toFixed(2)}</td>
+                    <td class="${pnlClass}">$${pnl.toFixed(2)}</td>
+                    <td class="${pnlClass}">${(pnlPct * 100).toFixed(2)}%</td>
+                    <td>${pos.stop_loss ? '$' + pos.stop_loss.toFixed(2) : '-'}</td>
+                    <td>${pos.target_1 ? '$' + pos.target_1.toFixed(2) : '-'}</td>
+                `;
+
+                tbody.appendChild(row);
+            });
+        }
+
+        function displaySummary(data, positionsData) {
             if (!data.summary) return;
 
             const summary = data.summary;
 
-            // Total P/L
+            // Calculate total P/L (realized + unrealized)
+            let unrealizedPnl = 0;
+            if (positionsData && positionsData.active_positions) {
+                Object.values(positionsData.active_positions).forEach(pos => {
+                    unrealizedPnl += (pos.unrealized_pl || 0);
+                });
+            }
+
+            const totalPnl = summary.total_pnl + unrealizedPnl;
+
+            // Total P/L (Realized + Unrealized)
             const pnlEl = document.getElementById('total-pnl');
-            pnlEl.textContent = `$${summary.total_pnl.toFixed(2)}`;
-            pnlEl.className = `stat-value ${summary.total_pnl >= 0 ? 'positive' : 'negative'}`;
+            pnlEl.textContent = `$${totalPnl.toFixed(2)}`;
+            pnlEl.className = `stat-value ${totalPnl >= 0 ? 'positive' : 'negative'}`;
 
             // Stats
             document.getElementById('total-trades').textContent = summary.total_trades;
