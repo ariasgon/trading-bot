@@ -134,6 +134,8 @@ class ProprietaryStrategy:
 
         # Time restriction
         self.trading_cutoff_hour = 12  # No trades after 12 PM EST (noon)
+        self.position_close_hour = 13  # Close all positions by 1 PM EST
+        self.position_close_minute = 0  # Close at exactly 1:00 PM
 
         # Trailing Stop Configuration
         self.enable_trailing_stops = True  # Enable trailing stop upgrades
@@ -168,6 +170,11 @@ class ProprietaryStrategy:
 
             self.is_active = True
             logger.info(f"✅ Strategy initialized - Today's realized P/L: ${self.daily_realized_pnl:.2f}")
+
+            # Log time restrictions
+            logger.info(f"⏰ Time restrictions:")
+            logger.info(f"   New trades cutoff: {self.trading_cutoff_hour}:00 PM EST")
+            logger.info(f"   Position close time: {self.position_close_hour}:{self.position_close_minute:02d} PM EST")
 
             # Log trailing stop configuration
             if self.enable_trailing_stops:
@@ -208,16 +215,32 @@ class ProprietaryStrategy:
         try:
             est = pytz.timezone('US/Eastern')
             current_time_est = datetime.now(est).time()
-            cutoff_time = time(self.trading_cutoff_hour, 0)  # 11:00 AM
+            cutoff_time = time(self.trading_cutoff_hour, 0)
 
             if current_time_est >= cutoff_time:
-                logger.info(f"⏰ Trading cutoff reached ({self.trading_cutoff_hour} AM EST) - no new trades")
+                logger.info(f"⏰ Trading cutoff reached ({self.trading_cutoff_hour} PM EST) - no new trades")
                 return False
 
             return True
 
         except Exception as e:
             logger.error(f"Error checking time restriction: {e}")
+            return False
+
+    def _should_close_all_positions(self) -> bool:
+        """Check if we should force close all positions due to time cutoff."""
+        try:
+            est = pytz.timezone('US/Eastern')
+            current_time_est = datetime.now(est).time()
+            close_time = time(self.position_close_hour, self.position_close_minute)
+
+            if current_time_est >= close_time:
+                return True
+
+            return False
+
+        except Exception as e:
+            logger.error(f"Error checking position close time: {e}")
             return False
 
     def _calculate_volume_pace(self, current_volume: float, avg_daily_volume: float) -> float:
@@ -1088,6 +1111,90 @@ class ProprietaryStrategy:
             logger.error(traceback.format_exc())
             return False
 
+    async def force_close_position(self, symbol: str, position_data: Dict, reason: str = "Time cutoff") -> bool:
+        """
+        Force close a position immediately with a market order.
+
+        This cancels all associated orders (bracket legs, trailing stops) and
+        exits the position at market price.
+
+        Args:
+            symbol: Stock symbol
+            position_data: Position information
+            reason: Reason for force close (for logging)
+
+        Returns:
+            True if successfully closed, False otherwise
+        """
+        try:
+            setup: TradeSetup = position_data['setup']
+
+            logger.info(f"⏰ {symbol}: FORCE CLOSING POSITION - {reason}")
+            logger.info(f"   Position size: {setup.position_size} shares")
+            logger.info(f"   Entry: ${setup.entry_price:.2f}")
+
+            # Step 1: Cancel all open orders for this symbol
+            try:
+                # Cancel parent order and all legs
+                parent_order_id = position_data.get('order_id')
+                if parent_order_id:
+                    logger.info(f"{symbol}: Cancelling parent order {parent_order_id} and all legs...")
+                    order_manager.cancel_order(parent_order_id)
+
+                # Cancel trailing stop if present
+                trailing_stop_id = position_data.get('trailing_stop_id')
+                if trailing_stop_id:
+                    logger.info(f"{symbol}: Cancelling trailing stop {trailing_stop_id}...")
+                    order_manager.cancel_order(trailing_stop_id)
+
+            except Exception as e:
+                logger.warning(f"{symbol}: Error cancelling orders: {e} (continuing with position close)")
+
+            # Step 2: Close position with market order
+            side = 'sell' if setup.signal_type == SignalType.LONG else 'buy'
+
+            logger.info(f"{symbol}: Placing market order to close position...")
+            close_order_id = order_manager.place_market_order(
+                symbol=symbol,
+                side=side,
+                quantity=setup.position_size,
+                trade_id=position_data.get('trade_id')
+            )
+
+            if close_order_id:
+                logger.info(f"✅ {symbol}: Position closed via market order {close_order_id}")
+
+                # Remove from active positions
+                if symbol in self.active_positions:
+                    del self.active_positions[symbol]
+
+                # Update database position status
+                try:
+                    with get_db_session() as db:
+                        position = db.query(Position).filter(
+                            Position.symbol == symbol,
+                            Position.status == PositionStatus.OPEN
+                        ).first()
+
+                        if position:
+                            position.status = PositionStatus.CLOSED
+                            db.commit()
+                            logger.info(f"{symbol}: Database position updated to CLOSED")
+
+                except Exception as e:
+                    logger.warning(f"{symbol}: Error updating database position: {e}")
+
+                return True
+            else:
+                logger.error(f"❌ {symbol}: Failed to place market close order")
+                return False
+
+        except Exception as e:
+            logger.error(f"Error force closing {symbol}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
+
     async def monitor_positions(self) -> List[Dict[str, Any]]:
         """
         Monitor active positions and upgrade to trailing stops when profitable.
@@ -1096,8 +1203,26 @@ class ProprietaryStrategy:
         1. Monitors positions for profitability
         2. Upgrades to trailing stop once profit threshold reached
         3. Logs position status with trailing stop indicators
+        4. Force closes all positions after 1 PM EST cutoff
         """
         exit_signals = []
+
+        # Check if we should force close all positions due to time cutoff
+        if self._should_close_all_positions():
+            if len(self.active_positions) > 0:
+                logger.warning(f"⏰ POSITION CLOSING TIME REACHED ({self.position_close_hour}:00 PM EST)")
+                logger.warning(f"   Force closing {len(self.active_positions)} open position(s)...")
+
+                # Close all positions
+                for symbol, pos_data in list(self.active_positions.items()):
+                    await self.force_close_position(
+                        symbol=symbol,
+                        position_data=pos_data,
+                        reason=f"Time cutoff ({self.position_close_hour}:00 PM EST)"
+                    )
+
+                logger.warning(f"✅ All positions closed due to time cutoff")
+                return exit_signals
 
         for symbol, pos_data in list(self.active_positions.items()):
             try:
