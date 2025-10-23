@@ -157,17 +157,21 @@ class OrderManagerService:
         quantity: int,
         stop_loss: float,
         take_profit: float,
-        trade_id: str = None
+        trade_id: str = None,
+        limit_price: Optional[float] = None
     ) -> Optional[str]:
         """
         Place a bracket order with entry, stop loss, and take profit using Trading API.
 
         Uses OCO (One-Cancels-Other) order class which creates:
-        - Main market order (entry)
+        - Main order (entry) - market or limit based on limit_price parameter
         - Stop loss order (triggered if price goes against you)
         - Take profit order (triggered if price goes in your favor)
 
         When one is filled, the other is automatically cancelled.
+
+        Args:
+            limit_price: If provided, uses limit order for entry. Otherwise uses market order.
         """
         try:
             if quantity <= 0:
@@ -182,25 +186,38 @@ class OrderManagerService:
             stop_loss = round(stop_loss, 2)
             take_profit = round(take_profit, 2)
 
-            logger.info(f"🎯 Placing BRACKET ORDER (OCO): {side} {quantity} {symbol}")
+            # Determine order type
+            order_type = OrderType.LIMIT.value if limit_price is not None else OrderType.MARKET.value
+            if limit_price is not None:
+                limit_price = round(limit_price, 2)
+
+            logger.info(f"🎯 Placing BRACKET ORDER ({order_type.upper()}): {side} {quantity} {symbol}")
+            if limit_price:
+                logger.info(f"   Entry Limit: ${limit_price:.2f}")
             logger.info(f"   Stop Loss: ${stop_loss:.2f}, Take Profit: ${take_profit:.2f}")
 
-            # Place bracket order using Trading API
-            # order_class='bracket' creates entry + stop loss + take profit in one call
-            order = self.api.submit_order(
-                symbol=symbol,
-                qty=quantity,
-                side=side.lower(),
-                type=OrderType.MARKET.value,
-                time_in_force=TimeInForce.DAY.value,
-                order_class='bracket',  # This is the KEY parameter!
-                stop_loss={
+            # Build order parameters
+            order_params = {
+                'symbol': symbol,
+                'qty': quantity,
+                'side': side.lower(),
+                'type': order_type,
+                'time_in_force': TimeInForce.DAY.value,
+                'order_class': 'bracket',  # This is the KEY parameter!
+                'stop_loss': {
                     'stop_price': str(stop_loss)
                 },
-                take_profit={
+                'take_profit': {
                     'limit_price': str(take_profit)
                 }
-            )
+            }
+
+            # Add limit price if using limit order
+            if limit_price is not None:
+                order_params['limit_price'] = str(limit_price)
+
+            # Place bracket order using Trading API
+            order = self.api.submit_order(**order_params)
 
             # Track the order
             order_data = {
@@ -209,6 +226,8 @@ class OrderManagerService:
                 "side": side.lower(),
                 "quantity": quantity,
                 "type": "bracket",
+                "order_type": order_type,
+                "limit_price": limit_price,
                 "stop_loss": stop_loss,
                 "take_profit": take_profit,
                 "status": order.status,
@@ -220,7 +239,9 @@ class OrderManagerService:
             redis_cache.set(f"order:{order.id}", order_data, expiration=86400)
 
             logger.info(f"✅ BRACKET ORDER PLACED: {order.id}")
-            logger.info(f"   Entry Order ID: {order.id}")
+            logger.info(f"   Entry Order ID: {order.id} ({order_type.upper()})")
+            if limit_price:
+                logger.info(f"   Entry Limit: ${limit_price:.2f}")
             logger.info(f"   Stop Loss: ${stop_loss:.2f}, Take Profit: ${take_profit:.2f}")
 
             return order.id
@@ -319,11 +340,166 @@ class OrderManagerService:
             logger.error(f"Error placing limit order for {symbol}: {e}")
             return None
     
+    def place_trailing_stop(
+        self,
+        symbol: str,
+        side: str,
+        quantity: int,
+        trail_percent: Optional[float] = None,
+        trail_price: Optional[float] = None,
+        trade_id: str = None
+    ) -> Optional[str]:
+        """
+        Place a trailing stop order.
+
+        Args:
+            symbol: Stock symbol
+            side: 'sell' for long positions, 'buy' for short positions
+            quantity: Number of shares
+            trail_percent: Percentage trail (e.g., 2.0 for 2%)
+            trail_price: Dollar trail (e.g., 2.00 for $2 trail)
+            trade_id: Optional trade ID for tracking
+
+        Returns:
+            Order ID if successful, None otherwise
+
+        Note: Must provide either trail_percent OR trail_price (not both)
+        """
+        try:
+            if quantity <= 0:
+                logger.error(f"Invalid quantity for {symbol}: {quantity}")
+                return None
+
+            if side.lower() not in ['buy', 'sell']:
+                logger.error(f"Invalid side for {symbol}: {side}")
+                return None
+
+            if trail_percent is None and trail_price is None:
+                logger.error(f"Must provide trail_percent or trail_price for {symbol}")
+                return None
+
+            if trail_percent is not None and trail_price is not None:
+                logger.error(f"Cannot provide both trail_percent and trail_price for {symbol}")
+                return None
+
+            # Build order parameters
+            order_params = {
+                'symbol': symbol,
+                'qty': quantity,
+                'side': side.lower(),
+                'type': OrderType.TRAILING_STOP.value,
+                'time_in_force': TimeInForce.GTC.value  # Good till canceled
+            }
+
+            if trail_percent is not None:
+                order_params['trail_percent'] = str(trail_percent)
+                logger.info(f"🔄 Placing trailing stop: {side} {quantity} {symbol} with {trail_percent}% trail")
+            else:
+                trail_price = round(trail_price, 2)
+                order_params['trail_price'] = str(trail_price)
+                logger.info(f"🔄 Placing trailing stop: {side} {quantity} {symbol} with ${trail_price} trail")
+
+            # Submit order
+            order = self.api.submit_order(**order_params)
+
+            # Track the order
+            order_data = {
+                "id": order.id,
+                "symbol": symbol,
+                "side": side.lower(),
+                "quantity": quantity,
+                "type": OrderType.TRAILING_STOP.value,
+                "trail_percent": trail_percent,
+                "trail_price": trail_price,
+                "status": order.status,
+                "submitted_at": datetime.now().isoformat(),
+                "trade_id": trade_id
+            }
+
+            self.pending_orders[order.id] = order_data
+            redis_cache.set(f"order:{order.id}", order_data, expiration=86400)
+
+            logger.info(f"✅ Trailing stop placed: {order.id}")
+            return order.id
+
+        except Exception as e:
+            logger.error(f"Error placing trailing stop for {symbol}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return None
+
+    def get_order_legs(self, parent_order_id: str) -> Dict[str, Any]:
+        """
+        Get the legs (child orders) of a bracket order.
+
+        Args:
+            parent_order_id: The ID of the parent bracket order
+
+        Returns:
+            Dictionary with stop_loss_id, take_profit_id, and parent order info
+        """
+        try:
+            # Get order details with nested legs
+            order = self.api.get_order(parent_order_id)
+
+            result = {
+                'parent_id': parent_order_id,
+                'stop_loss_id': None,
+                'take_profit_id': None,
+                'parent_status': order.status
+            }
+
+            # Check if order has legs
+            if hasattr(order, 'legs') and order.legs:
+                for leg in order.legs:
+                    if hasattr(leg, 'order_type'):
+                        if leg.order_type == 'stop':
+                            result['stop_loss_id'] = leg.id
+                            logger.info(f"Found stop loss leg: {leg.id}")
+                        elif leg.order_type == 'limit':
+                            result['take_profit_id'] = leg.id
+                            logger.info(f"Found take profit leg: {leg.id}")
+
+            return result
+
+        except Exception as e:
+            logger.error(f"Error getting order legs for {parent_order_id}: {e}")
+            return {'parent_id': parent_order_id, 'stop_loss_id': None, 'take_profit_id': None}
+
+    def cancel_stop_loss_leg(self, parent_order_id: str) -> bool:
+        """
+        Cancel the stop loss leg of a bracket order.
+
+        Args:
+            parent_order_id: The ID of the parent bracket order
+
+        Returns:
+            True if successfully cancelled, False otherwise
+        """
+        try:
+            # Get the order legs
+            legs = self.get_order_legs(parent_order_id)
+
+            if legs['stop_loss_id']:
+                logger.info(f"Cancelling stop loss leg: {legs['stop_loss_id']}")
+                self.api.cancel_order(legs['stop_loss_id'])
+                logger.info(f"✅ Stop loss leg cancelled: {legs['stop_loss_id']}")
+                return True
+            else:
+                logger.warning(f"No stop loss leg found for order {parent_order_id}")
+                return False
+
+        except Exception as e:
+            logger.error(f"Error cancelling stop loss leg for {parent_order_id}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
+
     def cancel_order(self, order_id: str) -> bool:
         """Cancel an existing order."""
         try:
             logger.info(f"Cancelling order: {order_id}")
-            
+
             self.api.cancel_order(order_id)
             
             # Remove from tracking

@@ -135,6 +135,11 @@ class ProprietaryStrategy:
         # Time restriction
         self.trading_cutoff_hour = 12  # No trades after 12 PM EST (noon)
 
+        # Trailing Stop Configuration
+        self.enable_trailing_stops = True  # Enable trailing stop upgrades
+        self.trailing_stop_percent = 2.0  # 2% trailing stop (recommended for gap trading)
+        self.trailing_upgrade_profit_threshold = 1.0  # Upgrade to trailing stop at +1% profit
+
     async def initialize_strategy(self) -> bool:
         """Initialize the strategy for the trading day."""
         try:
@@ -163,6 +168,15 @@ class ProprietaryStrategy:
 
             self.is_active = True
             logger.info(f"✅ Strategy initialized - Today's realized P/L: ${self.daily_realized_pnl:.2f}")
+
+            # Log trailing stop configuration
+            if self.enable_trailing_stops:
+                logger.info(f"🔄 Trailing stops: ENABLED")
+                logger.info(f"   Trail percentage: {self.trailing_stop_percent}%")
+                logger.info(f"   Upgrade at profit: +{self.trailing_upgrade_profit_threshold}%")
+            else:
+                logger.info(f"📍 Trailing stops: DISABLED (using fixed stops only)")
+
             return True
 
         except Exception as e:
@@ -986,12 +1000,102 @@ class ProprietaryStrategy:
             logger.error(f"Error creating position record: {e}")
             return ""
 
+    async def upgrade_to_trailing_stop(self, symbol: str, position_data: Dict) -> bool:
+        """
+        Upgrade a position from fixed stop to trailing stop once profitable.
+
+        This implements the hybrid approach:
+        1. Position enters with bracket order (fixed stop + take profit)
+        2. Once position reaches profit threshold, cancel fixed stop
+        3. Replace with trailing stop to lock in profits
+        4. Keep take-profit in place for upside capture
+
+        Args:
+            symbol: Stock symbol
+            position_data: Position information including setup and order IDs
+
+        Returns:
+            True if successfully upgraded, False otherwise
+        """
+        try:
+            setup: TradeSetup = position_data['setup']
+            entry_price = setup.entry_price
+
+            # Get current price
+            current_price = market_data_service.get_current_price(symbol)
+            if not current_price:
+                logger.warning(f"Could not get current price for {symbol}")
+                return False
+
+            # Calculate profit percentage
+            if setup.signal_type == SignalType.LONG:
+                profit_pct = ((current_price - entry_price) / entry_price) * 100
+            else:  # SHORT
+                profit_pct = ((entry_price - current_price) / entry_price) * 100
+
+            # Check if we've reached the upgrade threshold
+            if profit_pct >= self.trailing_upgrade_profit_threshold:
+                logger.info(f"🔄 {symbol}: Position profitable ({profit_pct:.2f}%), upgrading to trailing stop...")
+
+                # Get parent order ID
+                parent_order_id = position_data.get('order_id')
+                if not parent_order_id:
+                    logger.warning(f"{symbol}: No parent order ID found, cannot upgrade")
+                    return False
+
+                # Cancel the fixed stop loss from bracket order
+                logger.info(f"{symbol}: Cancelling fixed stop loss leg...")
+                if order_manager.cancel_stop_loss_leg(parent_order_id):
+
+                    # Place trailing stop order
+                    side = 'sell' if setup.signal_type == SignalType.LONG else 'buy'
+                    logger.info(f"{symbol}: Placing {self.trailing_stop_percent}% trailing stop...")
+
+                    trailing_stop_id = order_manager.place_trailing_stop(
+                        symbol=symbol,
+                        side=side,
+                        quantity=setup.position_size,
+                        trail_percent=self.trailing_stop_percent,
+                        trade_id=position_data.get('trade_id')
+                    )
+
+                    if trailing_stop_id:
+                        # Mark position as upgraded
+                        position_data['has_trailing_stop'] = True
+                        position_data['trailing_stop_id'] = trailing_stop_id
+                        position_data['upgraded_at_profit'] = profit_pct
+                        position_data['upgraded_at_price'] = current_price
+
+                        logger.info(f"✅ {symbol}: TRAILING STOP ACTIVE!")
+                        logger.info(f"   Profit at upgrade: {profit_pct:.2f}%")
+                        logger.info(f"   Entry: ${entry_price:.2f}, Current: ${current_price:.2f}")
+                        logger.info(f"   Trail: {self.trailing_stop_percent}%")
+                        logger.info(f"   Initial stop: ${current_price * (1 - self.trailing_stop_percent/100):.2f}")
+                        logger.info(f"   Take profit still active at: ${setup.target_price:.2f}")
+                        return True
+                    else:
+                        logger.error(f"❌ {symbol}: Failed to place trailing stop")
+                        return False
+                else:
+                    logger.error(f"❌ {symbol}: Failed to cancel fixed stop loss")
+                    return False
+
+            return False
+
+        except Exception as e:
+            logger.error(f"Error upgrading {symbol} to trailing stop: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
+
     async def monitor_positions(self) -> List[Dict[str, Any]]:
         """
-        Monitor active positions.
+        Monitor active positions and upgrade to trailing stops when profitable.
 
-        NOTE: With bracket orders, stops and targets are handled automatically.
-        This method is kept for logging and tracking purposes only.
+        With trailing stops enabled:
+        1. Monitors positions for profitability
+        2. Upgrades to trailing stop once profit threshold reached
+        3. Logs position status with trailing stop indicators
         """
         exit_signals = []
 
@@ -999,17 +1103,29 @@ class ProprietaryStrategy:
             try:
                 setup: TradeSetup = pos_data['setup']
 
+                # Check if position needs trailing stop upgrade
+                if self.enable_trailing_stops and not pos_data.get('has_trailing_stop', False):
+                    await self.upgrade_to_trailing_stop(symbol, pos_data)
+
                 # Get current price for logging
                 df = market_data_service.get_bars(symbol, timeframe='1Min', limit=5)
                 if df is not None and len(df) > 0:
                     current_price = df['close'].iloc[-1]
 
-                    # Just log position status
+                    # Calculate P/L
                     pnl = (current_price - setup.entry_price) * setup.position_size
                     if setup.signal_type == SignalType.SHORT:
                         pnl = -pnl
 
-                    logger.info(f"📍 {symbol}: Price=${current_price:.2f}, Unrealized P/L=${pnl:.2f}")
+                    profit_pct = (pnl / (setup.entry_price * setup.position_size)) * 100
+
+                    # Log position status with trailing stop indicator
+                    trailing_status = "🔄 Trailing" if pos_data.get('has_trailing_stop') else "📍 Fixed Stop"
+                    logger.info(f"{trailing_status} {symbol}: Price=${current_price:.2f}, P/L=${pnl:.2f} ({profit_pct:+.2f}%)")
+
+                    # Log additional info for trailing stops
+                    if pos_data.get('has_trailing_stop'):
+                        logger.info(f"   Upgraded at: {pos_data.get('upgraded_at_profit', 0):.2f}% profit")
 
             except Exception as e:
                 logger.error(f"Error monitoring position {symbol}: {e}")
