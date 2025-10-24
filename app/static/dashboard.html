@@ -798,16 +798,39 @@
 
         async function loadAccountInfo() {
             try {
-                const response = await fetch('/api/v1/bot/account-info');
+                const response = await fetch('/api/v1/trading/account-summary');
                 const data = await response.json();
 
+                // Update account balance (equity)
+                const accountEquity = parseFloat(data.account_equity || 0);
                 document.getElementById('account-balance').textContent =
-                    `$${parseFloat(data.portfolio_value || 0).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
+                    `$${accountEquity.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
 
+                // Update today's P&L
                 const dailyPnl = parseFloat(data.daily_pnl || 0);
                 const pnlElement = document.getElementById('daily-pnl');
-                pnlElement.textContent = `$${Math.abs(dailyPnl).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
+                pnlElement.textContent = `${dailyPnl >= 0 ? '+' : ''}$${dailyPnl.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
                 pnlElement.className = dailyPnl >= 0 ? 'card-value profit' : 'card-value loss';
+
+                // Update balance change info
+                const balanceChange = document.getElementById('balance-change');
+                if (balanceChange && data.cash) {
+                    balanceChange.textContent = `Cash: $${parseFloat(data.cash || 0).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
+                }
+
+                // Update P&L change info
+                const pnlChange = document.getElementById('pnl-change');
+                const pnlPercent = accountEquity > 0 ? (dailyPnl / accountEquity * 100) : 0;
+                if (pnlChange) {
+                    pnlChange.textContent = `${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(2)}%`;
+                    pnlChange.className = pnlPercent >= 0 ? 'card-change positive' : 'card-change negative';
+                }
+
+                // Update active positions count
+                const positionsInfo = document.getElementById('positions-info');
+                if (positionsInfo && data.positions_count !== undefined) {
+                    positionsInfo.textContent = `${data.positions_count} open`;
+                }
             } catch (error) {
                 console.error('Error loading account info:', error);
             }
