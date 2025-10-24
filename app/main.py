@@ -190,9 +190,14 @@ async def get_backtesting_dashboard():
     """Serve the dashboard with backtesting."""
     return FileResponse("app/static/dashboard_with_backtesting.html")
 
+@app.get("/trade-history")
+async def get_trade_history():
+    """Serve the trade history and P/L analytics dashboard."""
+    return FileResponse("app/static/trade_history.html")
+
 @app.get("/dashboard/history")
 async def get_history_dashboard():
-    """Serve the trade history and P/L analytics dashboard."""
+    """Serve the trade history and P/L analytics dashboard (legacy route)."""
     return FileResponse("app/static/trade_history.html")
 
 
