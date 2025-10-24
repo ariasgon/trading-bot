@@ -177,13 +177,18 @@ from fastapi.responses import FileResponse
 
 @app.get("/dashboard")
 async def get_dashboard():
-    """Serve the enhanced dashboard with backtesting."""
-    return FileResponse("app/static/dashboard_with_backtesting.html")
+    """Serve the professional dashboard."""
+    return FileResponse("app/static/dashboard.html")
 
 @app.get("/dashboard/legacy")
 async def get_legacy_dashboard():
-    """Serve the original dashboard."""
-    return FileResponse("app/static/dashboard.html")
+    """Serve the old dashboard."""
+    return FileResponse("app/static/dashboard_old.html")
+
+@app.get("/dashboard/backtesting")
+async def get_backtesting_dashboard():
+    """Serve the dashboard with backtesting."""
+    return FileResponse("app/static/dashboard_with_backtesting.html")
 
 @app.get("/dashboard/history")
 async def get_history_dashboard():
