@@ -492,7 +492,7 @@
                 <span>Trading Bot</span>
             </div>
             <div class="nav-menu">
-                <a href="/" class="nav-item active">Dashboard</a>
+                <a href="/dashboard" class="nav-item active">Dashboard</a>
                 <a href="/trade-history" class="nav-item">History</a>
             </div>
         </div>
@@ -847,20 +847,38 @@
                 const data = await response.json();
 
                 if (data.count > 0 && data.watchlist) {
-                    bodyEl.innerHTML = data.watchlist.map(stock => `
+                    // Convert watchlist object to array and sort by gap percentage
+                    const watchlistArray = Object.values(data.watchlist).sort((a, b) => {
+                        const gapA = Math.abs(b.gap_percent || 0);
+                        const gapB = Math.abs(a.gap_percent || 0);
+                        return gapA - gapB;
+                    });
+
+                    bodyEl.innerHTML = watchlistArray.map(stock => {
+                        // Calculate change percent if not provided
+                        let changePercent = stock.change_percent;
+                        if (changePercent === undefined && stock.current_price && stock.previous_close) {
+                            changePercent = ((stock.current_price - stock.previous_close) / stock.previous_close) * 100;
+                        }
+                        changePercent = changePercent || 0;
+
+                        const gapPercent = stock.gap_percent || 0;
+
+                        return `
                         <tr>
                             <td class="symbol-cell">${stock.symbol}</td>
                             <td>$${stock.current_price?.toFixed(2) || '0.00'}</td>
-                            <td class="${stock.change_percent >= 0 ? 'positive' : 'negative'}">
-                                ${stock.change_percent >= 0 ? '+' : ''}${stock.change_percent?.toFixed(2) || '0.00'}%
+                            <td class="${changePercent >= 0 ? 'positive' : 'negative'}">
+                                ${changePercent >= 0 ? '+' : ''}${changePercent.toFixed(2)}%
                             </td>
-                            <td class="${stock.gap_percent >= 0 ? 'positive' : 'negative'}">
-                                ${stock.gap_percent >= 0 ? '+' : ''}${stock.gap_percent?.toFixed(2) || '0.00'}%
+                            <td class="${gapPercent >= 0 ? 'positive' : 'negative'}">
+                                ${gapPercent >= 0 ? '+' : ''}${gapPercent.toFixed(2)}%
                             </td>
                             <td>${(stock.volume || 0).toLocaleString()}</td>
                             <td><span style="color: var(--text-secondary);">${stock.status || 'Monitoring'}</span></td>
                         </tr>
-                    `).join('');
+                        `;
+                    }).join('');
 
                     loadingEl.style.display = 'none';
                     tableEl.style.display = 'table';
