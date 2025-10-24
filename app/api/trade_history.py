@@ -47,9 +47,15 @@ async def get_trade_history(
                 # Status filter uses lowercase enum values
                 query = query.filter(Trade.status == status.lower())
 
+            # Date filtering: Use entry_time for all trades (open and closed)
+            # This ensures we see recent trades even if they haven't exited yet
             if start_date:
                 start_dt = datetime.strptime(start_date, "%Y-%m-%d")
                 query = query.filter(Trade.entry_time >= start_dt)
+            else:
+                # Default: show trades from last 90 days if no filter specified
+                default_start = datetime.now() - timedelta(days=90)
+                query = query.filter(Trade.entry_time >= default_start)
 
             if end_date:
                 end_dt = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
@@ -70,13 +76,13 @@ async def get_trade_history(
                 trade_dict = {
                     'id': str(trade.id),
                     'symbol': trade.symbol,
-                    'side': trade.side.value if trade.side else None,
+                    'side': trade.side if trade.side else None,  # Changed from enum to string
                     'quantity': trade.quantity,
                     'entry_price': float(trade.entry_price) if trade.entry_price else None,
                     'exit_price': float(trade.exit_price) if trade.exit_price else None,
                     'stop_loss': float(trade.stop_loss) if trade.stop_loss else None,
                     'target_price': float(trade.target_price) if trade.target_price else None,
-                    'status': trade.status.value if trade.status else None,
+                    'status': trade.status if trade.status else None,  # Changed from enum to string
                     'realized_pnl': float(trade.realized_pnl) if trade.realized_pnl else 0.0,
                     'unrealized_pnl': float(trade.unrealized_pnl) if trade.unrealized_pnl else 0.0,
                     'r_multiple': float(trade.r_multiple) if trade.r_multiple else None,

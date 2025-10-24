@@ -27,6 +27,30 @@
             text-align: center;
             margin-bottom: 30px;
             box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+            position: relative;
+        }
+
+        .nav-button {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 600;
+            font-size: 14px;
+            transition: all 0.3s ease;
+            text-decoration: none;
+            display: inline-block;
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+        }
+
+        .nav-button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(102, 126, 234, 0.6);
         }
         
         .full-width-section {
@@ -364,6 +388,7 @@
 <body>
     <div class="container">
         <div class="header">
+            <a href="/trade-history" class="nav-button">📊 View Trade History</a>
             <h1>🤖 Trading Bot Dashboard</h1>
             <p>Stock Trading Bot Control Center</p>
             <p id="status-message" class="success">Ready</p>
@@ -635,24 +660,35 @@
                         <div class="watchlist-grid-body">
                     `;
                     
-                    // Sort by gap percentage (highest gaps first)
-                    const sortedData = Object.values(data.watchlist).sort((a, b) => 
-                        Math.abs(b.gap_pre_market_percent || 0) - Math.abs(a.gap_pre_market_percent || 0)
-                    );
+                    // Sort by gap percentage (highest gaps first) - prioritize PREMARKET gaps
+                    const sortedData = Object.values(data.watchlist).sort((a, b) => {
+                        const gapA = Math.abs(a.premarket_gap_percent || a.gap_percent || a.gap_pre_market_percent || 0);
+                        const gapB = Math.abs(b.premarket_gap_percent || b.gap_percent || b.gap_pre_market_percent || 0);
+                        return gapB - gapA;
+                    });
                     
                     for (const item of sortedData) {
                         const formatting = item.display_formatting || {};
                         
-                        // Format prices
+                        // Format prices - use LATEST API field names with premarket
                         const prevClose = item.previous_close ? `$${item.previous_close.toFixed(2)}` : 'N/A';
-                        const preMktPrice = item.pre_market_price ? `$${item.pre_market_price.toFixed(2)}` : 'N/A';
-                        const openPrice = item.opening_price ? `$${item.opening_price.toFixed(2)}` : 'N/A';
+                        const preMktPrice = item.premarket_price ? `$${item.premarket_price.toFixed(2)}` : 
+                                           item.pre_market_price ? `$${item.pre_market_price.toFixed(2)}` : 
+                                           'N/A';  // Real premarket price
+                        const openPrice = item.today_open ? `$${item.today_open.toFixed(2)}` : 
+                                        item.opening_price ? `$${item.opening_price.toFixed(2)}` : 'N/A';
                         const currentPrice = item.current_price ? `$${item.current_price.toFixed(2)}` : 'N/A';
                         
-                        // Format gaps and changes
-                        const gapPercent = item.gap_pre_market_percent ? 
+                        // Format gaps - use PREMARKET gap as primary (most important for gap trading)
+                        const gapPercent = item.premarket_gap_percent ? 
+                            `${item.premarket_gap_percent > 0 ? '+' : ''}${item.premarket_gap_percent.toFixed(2)}%` :
+                            item.gap_percent ? 
+                            `${item.gap_percent > 0 ? '+' : ''}${item.gap_percent.toFixed(2)}%` : 
+                            item.gap_pre_market_percent ? 
                             `${item.gap_pre_market_percent > 0 ? '+' : ''}${item.gap_pre_market_percent.toFixed(2)}%` : '0.00%';
-                        const changePercent = item.price_change_percent ?
+                        const changePercent = item.gap_open_percent ?
+                            `${item.gap_open_percent > 0 ? '+' : ''}${item.gap_open_percent.toFixed(2)}%` :
+                            item.price_change_percent ?
                             `${item.price_change_percent > 0 ? '+' : ''}${item.price_change_percent.toFixed(2)}%` : '0.00%';
                         
                         // Format volume
@@ -661,27 +697,41 @@
                              item.volume > 1000 ? `${(item.volume / 1000).toFixed(0)}K` : item.volume.toString()) : 'N/A';
                         const volumeRatio = item.volume_ratio ? `(${item.volume_ratio.toFixed(1)}x)` : '';
                         
-                        // Background intensity
-                        const bgClass = formatting.bg_intensity === 'high' ? 'high-activity' : 
-                                       formatting.bg_intensity === 'medium' ? 'med-activity' : '';
+                        // Dynamic color coding based on gap percentage - prioritize PREMARKET
+                        const gapPercentNum = item.premarket_gap_percent || item.gap_percent || item.gap_pre_market_percent || 0;
+                        let bgClass = '';
+                        let gapColor = '#bdc3c7';
+                        let priceColor = '#ecf0f1';
+                        
+                        if (Math.abs(gapPercentNum) >= 5) {
+                            bgClass = 'high-activity';
+                            gapColor = gapPercentNum > 0 ? '#27ae60' : '#e74c3c';
+                            priceColor = '#ffffff';
+                        } else if (Math.abs(gapPercentNum) >= 2) {
+                            bgClass = 'med-activity';
+                            gapColor = gapPercentNum > 0 ? '#2ecc71' : '#ec7063';
+                            priceColor = '#ffffff';
+                        } else if (Math.abs(gapPercentNum) >= 1) {
+                            gapColor = gapPercentNum > 0 ? '#f39c12' : '#f7dc6f';
+                        }
                         
                         html += `
                             <div class="watchlist-grid-row ${bgClass}">
                                 <div class="grid-cell symbol-cell">
                                     <span class="symbol-badge">${item.symbol}</span>
-                                    <span class="session-indicator ${item.market_session || 'closed'}">${item.market_session?.replace('_', ' ').toUpperCase() || 'CLOSED'}</span>
+                                    <span class="session-indicator regular_hours">REGULAR</span>
                                 </div>
                                 <div class="grid-cell price-cell">${prevClose}</div>
                                 <div class="grid-cell price-cell">${preMktPrice}</div>
                                 <div class="grid-cell price-cell">${openPrice}</div>
-                                <div class="grid-cell price-cell" style="color: ${formatting.price_color || '#ecf0f1'}; font-weight: bold;">${currentPrice}</div>
-                                <div class="grid-cell gap-cell" style="color: ${formatting.gap_color || '#bdc3c7'}">
+                                <div class="grid-cell price-cell" style="color: ${priceColor}; font-weight: bold;">${currentPrice}</div>
+                                <div class="grid-cell gap-cell" style="color: ${gapColor}; font-weight: bold;">
                                     <strong>${gapPercent}</strong>
                                 </div>
-                                <div class="grid-cell change-cell" style="color: ${formatting.price_color || '#ecf0f1'}">
+                                <div class="grid-cell change-cell" style="color: ${priceColor}">
                                     <strong>${changePercent}</strong>
                                 </div>
-                                <div class="grid-cell volume-cell" style="color: ${formatting.volume_color || '#95a5a6'}">
+                                <div class="grid-cell volume-cell" style="color: #95a5a6">
                                     <div>${volumeStr}</div>
                                     <small class="volume-ratio">${volumeRatio}</small>
                                 </div>

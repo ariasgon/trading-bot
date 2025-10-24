@@ -23,12 +23,41 @@
             margin: 0 auto;
         }
 
+        .header-section {
+            position: relative;
+            margin-bottom: 30px;
+        }
+
         h1 {
             color: white;
             text-align: center;
-            margin-bottom: 30px;
+            margin-bottom: 0;
             font-size: 2.5em;
             text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+        }
+
+        .nav-button {
+            position: absolute;
+            top: 10px;
+            left: 20px;
+            background: white;
+            color: #667eea;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 600;
+            font-size: 14px;
+            transition: all 0.3s ease;
+            text-decoration: none;
+            display: inline-block;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+        }
+
+        .nav-button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(0,0,0,0.3);
+            background: #f8f9fa;
         }
 
         .dashboard {
@@ -294,7 +323,10 @@
 </head>
 <body>
     <div class="container">
-        <h1>Trade History & P/L Analytics</h1>
+        <div class="header-section">
+            <a href="/" class="nav-button">← Back to Dashboard</a>
+            <h1>Trade History & P/L Analytics</h1>
+        </div>
 
         <div id="error" class="error" style="display: none;"></div>
         <div id="loading" class="loading">Loading trade data...</div>
@@ -397,7 +429,7 @@
                 </div>
                 <div class="filter-input">
                     <label>Period (Days)</label>
-                    <input type="number" id="filter-days" value="30" min="1" max="365">
+                    <input type="number" id="filter-days" value="14" min="1" max="365">
                 </div>
                 <div class="filter-input">
                     <button onclick="applyFilters()">Apply Filters</button>
@@ -485,7 +517,7 @@
             symbol: '',
             strategy: '',
             status: '',
-            days: 30
+            days: 14
         };
 
         async function loadData() {
@@ -699,8 +731,8 @@
             document.getElementById('filter-symbol').value = '';
             document.getElementById('filter-strategy').value = '';
             document.getElementById('filter-status').value = '';
-            document.getElementById('filter-days').value = '30';
-            currentFilters = { symbol: '', strategy: '', status: '', days: 30 };
+            document.getElementById('filter-days').value = '14';
+            currentFilters = { symbol: '', strategy: '', status: '', days: 14 };
             loadData();
         }
 
