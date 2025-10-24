@@ -12,7 +12,7 @@ from datetime import datetime
 from app.core.config import settings
 from app.core.database import init_db, check_db_connection
 from app.core.cache import redis_cache
-from app.api import trading, monitoring, strategy, bot_control, test_ov, backtesting, trade_history
+from app.api import trading, monitoring, strategy, bot_control, test_ov, backtesting, trade_history, settings as settings_api
 
 # Configure logging
 logging.basicConfig(
@@ -147,6 +147,12 @@ app.include_router(
     trade_history.router,
     prefix="/api/v1/history",
     tags=["trade_history"]
+)
+
+app.include_router(
+    settings_api.router,
+    prefix="/api/v1/settings",
+    tags=["settings"]
 )
 
 # Crypto API router - DISABLED for stock trading only
