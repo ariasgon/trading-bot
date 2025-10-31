@@ -29,16 +29,32 @@ class PortfolioService:
         try:
             # Get account info from Alpaca
             account_info = order_manager.get_account_info()
-            
+
             # Get current positions
             positions = self.get_open_positions()
-            
+
             # Calculate total unrealized P&L
             total_unrealized_pnl = sum(pos.get('unrealized_pnl', 0) for pos in positions)
-            
-            # Get today's performance
-            today_performance = self.get_daily_performance(date.today())
-            
+
+            # Calculate today's P&L directly from trades closed today
+            today_start = datetime.combine(date.today(), datetime.min.time())
+            today_end = datetime.combine(date.today(), datetime.max.time())
+
+            with get_db_session() as db:
+                # Get realized P&L from trades closed today
+                closed_trades_today = db.query(Trade).filter(
+                    Trade.exit_time >= today_start,
+                    Trade.exit_time <= today_end,
+                    Trade.status == 'filled',  # Use string instead of enum
+                    Trade.realized_pnl.is_not(None)
+                ).all()
+
+                realized_pnl_today = sum(float(t.realized_pnl) for t in closed_trades_today)
+
+                # Total daily P&L = realized P&L from closed trades + unrealized P&L from open positions
+                daily_pnl = realized_pnl_today + total_unrealized_pnl
+                daily_trades_count = len(closed_trades_today)
+
             summary = {
                 "account_equity": account_info.get('equity', 0),
                 "cash": account_info.get('cash', 0),
@@ -46,17 +62,17 @@ class PortfolioService:
                 "portfolio_value": account_info.get('portfolio_value', 0),
                 "positions_count": len(positions),
                 "total_unrealized_pnl": total_unrealized_pnl,
-                "daily_pnl": today_performance.get('total_pnl', 0) if today_performance else 0,
-                "daily_trades": today_performance.get('total_trades', 0) if today_performance else 0,
-                "win_rate": today_performance.get('win_rate', 0) if today_performance else 0,
+                "daily_pnl": daily_pnl,
+                "daily_trades": daily_trades_count,
+                "win_rate": 0,  # Can be calculated from closed trades if needed
                 "last_updated": datetime.now().isoformat()
             }
-            
+
             # Cache the summary
             redis_cache.set("account_summary", summary, expiration=60)
-            
+
             return summary
-            
+
         except Exception as e:
             logger.error(f"Error getting account summary: {e}")
             return {}
@@ -100,7 +116,7 @@ class PortfolioService:
                     position_list.append(position_data)
             
             # Also get positions directly from Alpaca (for positions not tracked in database)
-            alpaca_positions = order_manager.get_positions()
+            alpaca_positions = order_manager.get_open_positions()
             
             # Get symbols already in database to avoid duplicates
             db_symbols = {pos['symbol'] for pos in position_list}
@@ -387,25 +403,74 @@ class PortfolioService:
             logger.error(f"Error checking risk limits: {e}")
             return {"violations_count": 0, "violations": [], "risk_status": "error"}
     
-    def get_watchlist(self) -> List[str]:
-        """Get current trading watchlist."""
+    async def get_watchlist(self) -> List[str]:
+        """Get current trading watchlist using dynamic gap and volume scanner."""
         try:
-            # Check cache first
-            cached_watchlist = redis_cache.get("watchlist")
-            if cached_watchlist:
-                return cached_watchlist
+            from app.services.market_scanner import market_scanner
             
-            # Default watchlist for Oliver Velez strategy
-            default_watchlist = [
-                "AAPL", "MSFT", "GOOGL", "AMZN", "TSLA",
-                "META", "NVDA", "NFLX", "AMD", "CRM",
-                "SHOP", "SQ", "ROKU", "ZOOM", "DOCU"
+            logger.info("🔍 DYNAMIC SCANNER: Finding biggest gappers from S&P 500 + NASDAQ...")
+            
+            # Use the market scanner to find top gappers
+            gappers = await market_scanner.scan_for_gappers()
+            
+            if gappers and len(gappers) > 0:
+                # Extract symbols from gappers
+                dynamic_watchlist = [gapper.symbol for gapper in gappers[:30]]  # Top 30 (expanded from 15)
+                
+                logger.info(f"✅ DYNAMIC SCANNER: Found {len(gappers)} total gappers")
+                logger.info(f"📊 TOP GAPPERS: {', '.join(dynamic_watchlist[:5])} (showing top 5)")
+                
+                # Log gap details for top 5
+                for i, gapper in enumerate(gappers[:5]):
+                    gap_type = "PREMARKET" if abs(gapper.premarket_gap_percent) > abs(gapper.gap_percent) else "REGULAR"
+                    gap_pct = gapper.premarket_gap_percent if gap_type == "PREMARKET" else gapper.gap_percent
+                    logger.info(f"  #{i+1}: {gapper.symbol} - {gap_type} Gap: {gap_pct:+.2f}%, Score: {gapper.score:.1f}")
+                
+                return dynamic_watchlist
+                
+            else:
+                # Fallback to liquid stocks if scanner fails
+                logger.warning("⚠️ Market scanner found no gappers, using fallback liquid stocks")
+                fallback_list = [
+                    # Mega-cap tech
+                    "AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "META", "NVDA", "NFLX", "AMD", "CRM",
+                    # High volatility tech
+                    "COIN", "RBLX", "HOOD", "SOFI", "SHOP", "SQ", "UBER",
+                    # Biotech
+                    "MRNA", "BNTX", "PFE",
+                    # Finance
+                    "JPM", "BAC", "GS",
+                    # Crypto-related
+                    "MARA", "RIOT",
+                    # Leveraged ETFs
+                    "SOXL", "TQQQ", "SPXL",
+                    # ETFs
+                    "SPY", "QQQ"
+                ]
+                return fallback_list
+                
+        except Exception as e:
+            logger.error(f"Error with dynamic watchlist scanner: {e}")
+
+            # Fallback to liquid stocks on error
+            fallback_list = [
+                # Mega-cap tech
+                "AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "META", "NVDA", "NFLX", "AMD", "CRM",
+                # High volatility tech
+                "COIN", "RBLX", "HOOD", "SOFI", "SHOP", "SQ", "UBER",
+                # Biotech
+                "MRNA", "BNTX", "PFE",
+                # Finance
+                "JPM", "BAC", "GS",
+                # Crypto-related
+                "MARA", "RIOT",
+                # Leveraged ETFs
+                "SOXL", "TQQQ", "SPXL",
+                # ETFs
+                "SPY", "QQQ"
             ]
-            
-            # Cache for 1 hour
-            redis_cache.set("watchlist", default_watchlist, expiration=3600)
-            
-            return default_watchlist
+            logger.info(f"📋 Using fallback watchlist: {len(fallback_list)} symbols")
+            return fallback_list
             
         except Exception as e:
             logger.error(f"Error getting watchlist: {e}")

@@ -45,6 +45,7 @@ import asyncio
 import logging
 import pandas as pd
 import pytz
+import time as time_module
 from decimal import Decimal
 from datetime import datetime, time, timedelta
 from typing import Dict, List, Optional, Any, Tuple
@@ -116,7 +117,9 @@ class ProprietaryStrategy:
         self.min_gap_percent = 0.75
         self.max_gap_percent = 20.0
         self.min_volume_ratio = 2.0  # CRITICAL: Volume must be 2x average
-        self.atr_stop_multiplier = 2.0
+        self.atr_stop_multiplier = 1.5  # 1.5x ATR for breathing room (was 0.9 - too tight!)
+        self.min_stop_distance_dollars = 0.30  # Minimum $0.30 stop distance
+        self.min_stop_distance_percent = 1.2  # OR 1.2% of price, whichever is larger
 
         # RSI thresholds
         self.rsi_overbought = 70
@@ -132,15 +135,30 @@ class ProprietaryStrategy:
         self.max_daily_loss = 600.0  # Max $600 potential loss per day
         self.daily_realized_pnl = 0.0  # Track today's realized P/L
 
-        # Time restriction
-        self.trading_cutoff_hour = 12  # No trades after 12 PM EST (noon)
-        self.position_close_hour = 13  # Close all positions by 1 PM EST
-        self.position_close_minute = 0  # Close at exactly 1:00 PM
+        # Time restriction - Extended to capture afternoon moves
+        self.trading_cutoff_hour = 14  # No new trades after 2 PM EST
+        self.position_close_hour = 15  # Close all positions by 3:50 PM EST
+        self.position_close_minute = 50  # Close at exactly 3:50 PM
 
-        # Trailing Stop Configuration
+        # DOLLAR-BASED TRAILING STOP SYSTEM
         self.enable_trailing_stops = True  # Enable trailing stop upgrades
-        self.trailing_stop_percent = 2.0  # 2% trailing stop (recommended for gap trading)
-        self.trailing_upgrade_profit_threshold = 1.0  # Upgrade to trailing stop at +1% profit
+        self.use_dollar_based_stops = True  # Use dollar amounts instead of percentages
+
+        # Dollar-based profit lock tiers (activate immediately from entry)
+        self.breakeven_profit_threshold = 15.0   # At +$15: Move stop to breakeven (lowered from $30)
+        self.quick_profit_threshold = 20.0       # At +$20 within 10 min: Immediate breakeven
+        self.quick_profit_time_window = 600      # 10 minutes (600 seconds)
+        self.tier1_profit_threshold = 50.0       # At +$50: Lock in $50 profit
+        self.tier2_profit_threshold = 100.0      # At +$100: Lock in $100 profit
+        self.profit_increment = 50.0             # Every additional $50: Move stop up
+
+        # Whipsaw prevention
+        self.stop_out_cooldown = 1200            # 20 minutes cooldown after stop out (seconds)
+        self.recent_stop_outs: Dict[str, float] = {}  # Track stop out timestamps by symbol
+
+        # Profit target multipliers (adjusted for tighter stops)
+        self.profit_target_multiplier = 2.5      # Target = 2.5x initial risk
+        self.aggressive_target_multiplier = 3.5  # Aggressive target for strong setups
 
     async def initialize_strategy(self) -> bool:
         """Initialize the strategy for the trading day."""
@@ -176,11 +194,14 @@ class ProprietaryStrategy:
             logger.info(f"   New trades cutoff: {self.trading_cutoff_hour}:00 PM EST")
             logger.info(f"   Position close time: {self.position_close_hour}:{self.position_close_minute:02d} PM EST")
 
-            # Log trailing stop configuration
-            if self.enable_trailing_stops:
-                logger.info(f"🔄 Trailing stops: ENABLED")
-                logger.info(f"   Trail percentage: {self.trailing_stop_percent}%")
-                logger.info(f"   Upgrade at profit: +{self.trailing_upgrade_profit_threshold}%")
+            # Log dollar-based trailing stop configuration
+            if self.enable_trailing_stops and self.use_dollar_based_stops:
+                logger.info(f"💰 DOLLAR-BASED STOP MANAGEMENT: ENABLED")
+                logger.info(f"   ${self.breakeven_profit_threshold:.0f} profit → Move to BREAKEVEN")
+                logger.info(f"   ${self.tier1_profit_threshold:.0f} profit → Lock in ${self.tier1_profit_threshold:.0f}")
+                logger.info(f"   ${self.tier2_profit_threshold:.0f} profit → Lock in ${self.tier2_profit_threshold:.0f}")
+                logger.info(f"   Every +${self.profit_increment:.0f} → Continue moving stop up")
+                logger.info(f"   Initial stop: {self.atr_stop_multiplier}x ATR (10% tighter)")
             else:
                 logger.info(f"📍 Trailing stops: DISABLED (using fixed stops only)")
 
@@ -411,6 +432,17 @@ class ProprietaryStrategy:
 
         for symbol in symbols:
             try:
+                # WHIPSAW PREVENTION: Check cooldown after stop out
+                if symbol in self.recent_stop_outs:
+                    time_since_stop = time_module.time() - self.recent_stop_outs[symbol]
+                    if time_since_stop < self.stop_out_cooldown:
+                        remaining = int(self.stop_out_cooldown - time_since_stop)
+                        logger.debug(f"⏸️ {symbol} in cooldown after stop out ({remaining}s remaining)")
+                        continue
+                    else:
+                        # Cooldown expired, remove from tracking
+                        del self.recent_stop_outs[symbol]
+
                 # Get market data
                 df_daily = market_data_service.get_bars(symbol, timeframe='1Day', limit=100)
                 df_5min = market_data_service.get_bars(symbol, timeframe='5Min', limit=100)
@@ -759,13 +791,34 @@ class ProprietaryStrategy:
             # Calculate entry levels
             entry_price = current_price
 
-            # Calculate stop loss and target (ATR-based)
+            # Calculate stop loss and target (ATR-based with MINIMUM DISTANCE enforcement)
             if signal_type == SignalType.LONG:
-                stop_loss = entry_price - (current_atr * self.atr_stop_multiplier)
-                target_price = entry_price + (current_atr * 1.5)  # 1.5x ATR target
+                # Calculate ATR-based stop
+                atr_stop_distance = current_atr * self.atr_stop_multiplier
+
+                # Calculate minimum stop distance (greater of $0.30 or 1.2% of price)
+                min_stop_dollar = self.min_stop_distance_dollars
+                min_stop_percent = entry_price * (self.min_stop_distance_percent / 100.0)
+                min_stop_distance = max(min_stop_dollar, min_stop_percent)
+
+                # Use the LARGER of ATR-based or minimum stop distance
+                final_stop_distance = max(atr_stop_distance, min_stop_distance)
+                stop_loss = entry_price - final_stop_distance
+                target_price = entry_price + (final_stop_distance * 2.5)  # 2.5x risk for reward
+
             else:  # SHORT
-                stop_loss = entry_price + (current_atr * self.atr_stop_multiplier)
-                target_price = entry_price - (current_atr * 1.5)
+                # Calculate ATR-based stop
+                atr_stop_distance = current_atr * self.atr_stop_multiplier
+
+                # Calculate minimum stop distance (greater of $0.30 or 1.2% of price)
+                min_stop_dollar = self.min_stop_distance_dollars
+                min_stop_percent = entry_price * (self.min_stop_distance_percent / 100.0)
+                min_stop_distance = max(min_stop_dollar, min_stop_percent)
+
+                # Use the LARGER of ATR-based or minimum stop distance
+                final_stop_distance = max(atr_stop_distance, min_stop_distance)
+                stop_loss = entry_price + final_stop_distance
+                target_price = entry_price - (final_stop_distance * 2.5)
 
             # Validate levels
             if signal_type == SignalType.LONG:
@@ -1025,13 +1078,13 @@ class ProprietaryStrategy:
 
     async def upgrade_to_trailing_stop(self, symbol: str, position_data: Dict) -> bool:
         """
-        Upgrade a position from fixed stop to trailing stop once profitable.
+        Upgrade position stop based on DOLLAR PROFIT MILESTONES.
 
-        This implements the hybrid approach:
-        1. Position enters with bracket order (fixed stop + take profit)
-        2. Once position reaches profit threshold, cancel fixed stop
-        3. Replace with trailing stop to lock in profits
-        4. Keep take-profit in place for upside capture
+        DOLLAR-BASED PROFIT PROTECTION TIERS:
+        - $30 profit: Move stop to breakeven (protect entry)
+        - $50 profit: Lock in $50 profit minimum
+        - $100 profit: Lock in $100 profit minimum
+        - Every +$50: Continue moving stop up to lock in gains
 
         Args:
             symbol: Stock symbol
@@ -1050,66 +1103,128 @@ class ProprietaryStrategy:
                 logger.warning(f"Could not get current price for {symbol}")
                 return False
 
-            # Calculate profit percentage
+            # Calculate dollar profit
             if setup.signal_type == SignalType.LONG:
-                profit_pct = ((current_price - entry_price) / entry_price) * 100
+                dollar_profit = (current_price - entry_price) * setup.position_size
+                profit_per_share = current_price - entry_price
             else:  # SHORT
-                profit_pct = ((entry_price - current_price) / entry_price) * 100
+                dollar_profit = (entry_price - current_price) * setup.position_size
+                profit_per_share = entry_price - current_price
 
-            # Check if we've reached the upgrade threshold
-            if profit_pct >= self.trailing_upgrade_profit_threshold:
-                logger.info(f"🔄 {symbol}: Position profitable ({profit_pct:.2f}%), upgrading to trailing stop...")
+            # Determine new stop price based on dollar profit tiers
+            # IMPORTANT: Stops lock at profit - $30 buffer to give room
+            # Example: At $80 profit → locks $50 (has $30 buffer)
 
-                # Get parent order ID
-                parent_order_id = position_data.get('order_id')
-                if not parent_order_id:
-                    logger.warning(f"{symbol}: No parent order ID found, cannot upgrade")
-                    return False
+            new_stop_price = None
+            tier_name = None
+            locked_profit = 0.0
 
-                # Cancel the fixed stop loss from bracket order
-                logger.info(f"{symbol}: Cancelling fixed stop loss leg...")
-                if order_manager.cancel_stop_loss_leg(parent_order_id):
+            BUFFER = 30.0  # Always maintain $30 buffer above locked profit
 
-                    # Place trailing stop order
+            # QUICK PROFIT PROTECTION: If hit $20+ profit within first 10 minutes, immediately lock breakeven
+            position_age = position_data.get('age_seconds', 999999)
+            if dollar_profit >= self.quick_profit_threshold and position_age <= self.quick_profit_time_window:
+                # Quick profit detected - immediate breakeven protection
+                if not position_data.get('has_trailing_stop'):  # Only if not already protected
+                    locked_profit = 0.0
+                    tier_name = f"Quick Profit Protection (${dollar_profit:.0f} in {int(position_age/60)}min)"
+                    logger.info(f"⚡ {symbol}: QUICK PROFIT - Moving to breakeven immediately!")
+
+            elif dollar_profit >= self.breakeven_profit_threshold:
+                # Calculate locked profit with buffer
+                if dollar_profit < (self.tier1_profit_threshold + BUFFER):
+                    # Between $30-$79: Lock breakeven only
+                    locked_profit = 0.0
+                    tier_name = "Breakeven ($30 reached)"
+                else:
+                    # $80+: Lock in $50 increments with $30 buffer
+                    # Formula: locked_profit = floor((current_profit - buffer) / increment) * increment
+                    profit_above_buffer = dollar_profit - BUFFER
+                    increments = int(profit_above_buffer // self.profit_increment)
+                    locked_profit = increments * self.profit_increment
+
+                    if locked_profit >= 100:
+                        tier_name = f"$100+ Tier (${int(locked_profit)} locked, ${int(dollar_profit - locked_profit)} buffer)"
+                    else:
+                        tier_name = f"${int(locked_profit)} Locked (${int(dollar_profit - locked_profit)} buffer)"
+
+            # Calculate new stop price to lock in the profit
+            if tier_name:
+                if setup.signal_type == SignalType.LONG:
+                    new_stop_price = entry_price + (locked_profit / setup.position_size)
+                else:  # SHORT
+                    new_stop_price = entry_price - (locked_profit / setup.position_size)
+
+                # Check if this is an improvement over current stop
+                current_locked_profit = position_data.get('locked_profit', -999999)
+
+                # Only upgrade if we're locking in MORE profit than before
+                if locked_profit > current_locked_profit:
+                    action = "Upgrading" if position_data.get('has_trailing_stop') else "Activating"
+                    logger.info(f"💰 {symbol}: {action} stop to lock ${locked_profit:.0f} profit - {tier_name}")
+                    logger.info(f"   Current profit: ${dollar_profit:.2f}")
+                    logger.info(f"   Entry: ${entry_price:.2f} → Current: ${current_price:.2f}")
+                    logger.info(f"   New stop: ${new_stop_price:.2f}")
+
+                    # Get parent order ID
+                    parent_order_id = position_data.get('order_id')
+                    if not parent_order_id:
+                        logger.warning(f"{symbol}: No parent order ID found")
+                        return False
+
+                    # Cancel existing stop
+                    if position_data.get('has_trailing_stop'):
+                        old_stop_id = position_data.get('trailing_stop_id')
+                        if old_stop_id:
+                            logger.info(f"{symbol}: Cancelling old stop...")
+                            order_manager.cancel_order(old_stop_id)
+                    else:
+                        logger.info(f"{symbol}: Cancelling fixed stop loss...")
+                        order_manager.cancel_stop_loss_leg(parent_order_id)
+
+                    # Place new stop loss order at the calculated price
                     side = 'sell' if setup.signal_type == SignalType.LONG else 'buy'
-                    logger.info(f"{symbol}: Placing {self.trailing_stop_percent}% trailing stop...")
 
-                    trailing_stop_id = order_manager.place_trailing_stop(
+                    new_stop_id = order_manager.place_stop_loss(
                         symbol=symbol,
                         side=side,
                         quantity=setup.position_size,
-                        trail_percent=self.trailing_stop_percent,
+                        stop_price=new_stop_price,
                         trade_id=position_data.get('trade_id')
                     )
 
-                    if trailing_stop_id:
+                    if new_stop_id:
                         # Mark position as upgraded
                         position_data['has_trailing_stop'] = True
-                        position_data['trailing_stop_id'] = trailing_stop_id
-                        position_data['upgraded_at_profit'] = profit_pct
-                        position_data['upgraded_at_price'] = current_price
+                        position_data['trailing_stop_id'] = new_stop_id
+                        position_data['locked_profit'] = locked_profit
+                        position_data['stop_price'] = new_stop_price
+                        position_data['upgraded_at_profit'] = dollar_profit
+                        position_data['tier'] = tier_name
 
-                        logger.info(f"✅ {symbol}: TRAILING STOP ACTIVE!")
-                        logger.info(f"   Profit at upgrade: {profit_pct:.2f}%")
-                        logger.info(f"   Entry: ${entry_price:.2f}, Current: ${current_price:.2f}")
-                        logger.info(f"   Trail: {self.trailing_stop_percent}%")
-                        logger.info(f"   Initial stop: ${current_price * (1 - self.trailing_stop_percent/100):.2f}")
-                        logger.info(f"   Take profit still active at: ${setup.target_price:.2f}")
+                        logger.info(f"✅ {symbol}: STOP UPGRADED - ${locked_profit:.0f} profit protected!")
                         return True
                     else:
-                        logger.error(f"❌ {symbol}: Failed to place trailing stop")
+                        logger.error(f"❌ {symbol}: Failed to place new stop")
                         return False
-                else:
-                    logger.error(f"❌ {symbol}: Failed to cancel fixed stop loss")
-                    return False
 
             return False
 
         except Exception as e:
-            logger.error(f"Error upgrading {symbol} to trailing stop: {e}")
+            logger.error(f"Error upgrading {symbol} stop: {e}")
             import traceback
             logger.error(traceback.format_exc())
             return False
+
+    def _track_stop_out(self, symbol: str) -> None:
+        """
+        Track when a position is stopped out to prevent immediate re-entry (whipsaw prevention).
+
+        Args:
+            symbol: Stock symbol that was stopped out
+        """
+        self.recent_stop_outs[symbol] = time_module.time()
+        logger.info(f"🛑 {symbol}: Stopped out - cooldown activated for {int(self.stop_out_cooldown/60)} minutes")
 
     async def force_close_position(self, symbol: str, position_data: Dict, reason: str = "Time cutoff") -> bool:
         """
@@ -1127,6 +1242,9 @@ class ProprietaryStrategy:
             True if successfully closed, False otherwise
         """
         try:
+            # Track stop out if this is a stop loss trigger (not time cutoff)
+            if "stop" in reason.lower():
+                self._track_stop_out(symbol)
             setup: TradeSetup = position_data['setup']
 
             logger.info(f"⏰ {symbol}: FORCE CLOSING POSITION - {reason}")
@@ -1244,13 +1362,15 @@ class ProprietaryStrategy:
 
                     profit_pct = (pnl / (setup.entry_price * setup.position_size)) * 100
 
-                    # Log position status with trailing stop indicator
-                    trailing_status = "🔄 Trailing" if pos_data.get('has_trailing_stop') else "📍 Fixed Stop"
-                    logger.info(f"{trailing_status} {symbol}: Price=${current_price:.2f}, P/L=${pnl:.2f} ({profit_pct:+.2f}%)")
+                    # Log position status with dollar profit
+                    stop_status = pos_data.get('tier', '📍 Fixed Stop')
+                    locked_profit = pos_data.get('locked_profit', 0.0)
 
-                    # Log additional info for trailing stops
-                    if pos_data.get('has_trailing_stop'):
-                        logger.info(f"   Upgraded at: {pos_data.get('upgraded_at_profit', 0):.2f}% profit")
+                    logger.info(f"💼 {symbol}: ${current_price:.2f} | P/L: ${pnl:.2f} ({profit_pct:+.2f}%) | {stop_status}")
+
+                    # Log stop protection level
+                    if pos_data.get('has_trailing_stop') and locked_profit > 0:
+                        logger.info(f"   🛡️ Protected: ${locked_profit:.0f} minimum")
 
             except Exception as e:
                 logger.error(f"Error monitoring position {symbol}: {e}")

@@ -5,31 +5,47 @@ Provides comprehensive logging of trading analysis, OV signals, and position man
 for display on the dashboard.
 """
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+import pytz
 from typing import Dict, List, Optional, Any
 from collections import deque
 import json
 
 from app.core.cache import redis_cache
-from app.strategies.ov_core_signals import OVCoreSignals
-from app.strategies.ov_position_manager import ov_position_manager
 
 logger = logging.getLogger(__name__)
 
 
 class AnalysisLogger:
     """Centralized analysis logging for dashboard display."""
-    
+
     def __init__(self, max_logs: int = 100):
         self.max_logs = max_logs
-        self.ov_signals = OVCoreSignals()
+        self.ov_signals = None  # Lazy init to avoid circular imports
+        self.ov_position_manager = None  # Lazy init to avoid circular imports
         self.analysis_logs = deque(maxlen=max_logs)
         self.last_analysis_time = None
+        # Use Eastern Time for trading (where NYSE is located)
+        self.trading_timezone = pytz.timezone('US/Eastern')
+
+    def _ensure_initialized(self):
+        """Lazy initialization of strategy components to avoid circular imports."""
+        if self.ov_signals is None:
+            from app.strategies.ov_core_signals import OVCoreSignals
+            self.ov_signals = OVCoreSignals()
+
+        if self.ov_position_manager is None:
+            from app.strategies.ov_position_manager import ov_position_manager
+            self.ov_position_manager = ov_position_manager
+        
+    def _get_trading_time(self) -> datetime:
+        """Get current time in trading timezone (US/Eastern)."""
+        return datetime.now(self.trading_timezone)
         
     def log_ov_analysis(self, symbol: str, ov_results: Dict[str, Any]) -> None:
         """Log Oliver Velez analysis results."""
         try:
-            timestamp = datetime.now()
+            timestamp = self._get_trading_time()
             
             if 'error' in ov_results:
                 self._add_log('error', f"OV Analysis failed: {ov_results['error']}", symbol, timestamp)
@@ -101,7 +117,7 @@ class AnalysisLogger:
     def log_position_update(self, symbol: str, action: str, details: Dict[str, Any]) -> None:
         """Log position management actions."""
         try:
-            timestamp = datetime.now()
+            timestamp = self._get_trading_time()
             
             if action == "scale_out_t1":
                 price = details.get('sale_price', 0)
@@ -138,7 +154,7 @@ class AnalysisLogger:
     def log_trade_entry(self, symbol: str, entry_price: float, shares: int, setup_reasons: List[str], protective_orders: Dict[str, Any] = None) -> None:
         """Log new trade entry with protective orders information."""
         try:
-            timestamp = datetime.now()
+            timestamp = self._get_trading_time()
             reasons_str = ', '.join(setup_reasons[:3])  # Top 3 reasons
             
             # Basic entry log
@@ -169,7 +185,7 @@ class AnalysisLogger:
     def log_watchlist_scan(self, symbols_scanned: int, setups_found: int, top_symbols: List[str]) -> None:
         """Log watchlist scanning results."""
         try:
-            timestamp = datetime.now()
+            timestamp = self._get_trading_time()
             if setups_found > 0:
                 symbols_str = ', '.join(top_symbols[:3])
                 self._add_log('success', f"Scan complete: {setups_found} setups found in {symbols_scanned} symbols - Top: {symbols_str}", None, timestamp)
@@ -181,7 +197,7 @@ class AnalysisLogger:
     def log_market_session_change(self, old_session: str, new_session: str) -> None:
         """Log market session changes."""
         try:
-            timestamp = datetime.now()
+            timestamp = self._get_trading_time()
             self._add_log('info', f"Market session: {old_session} → {new_session}", None, timestamp)
         except Exception as e:
             logger.error(f"Error logging session change: {e}")
@@ -245,7 +261,8 @@ class AnalysisLogger:
     def get_position_summary(self) -> Dict[str, Any]:
         """Get summary of managed positions for dashboard."""
         try:
-            managed_positions = ov_position_manager.get_all_managed_positions()
+            self._ensure_initialized()
+            managed_positions = self.ov_position_manager.get_all_managed_positions()
             
             summary = {
                 'total_positions': len(managed_positions),

@@ -368,6 +368,20 @@
 
                 <!-- Closed Trades Tab -->
                 <div id="closed-tab" class="tab-content active">
+                    <!-- Filters -->
+                    <div style="padding: 16px; border-bottom: 1px solid var(--border-color); display: flex; gap: 16px; align-items: center; flex-wrap: wrap;">
+                        <div style="display: flex; align-items: center; gap: 8px;">
+                            <label style="color: var(--text-secondary); font-size: 14px;">From:</label>
+                            <input type="date" id="start-date" style="padding: 8px 12px; border-radius: 6px; border: 1px solid var(--border-color); background: var(--bg-tertiary); color: var(--text-primary); font-size: 14px;">
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 8px;">
+                            <label style="color: var(--text-secondary); font-size: 14px;">To:</label>
+                            <input type="date" id="end-date" style="padding: 8px 12px; border-radius: 6px; border: 1px solid var(--border-color); background: var(--bg-tertiary); color: var(--text-primary); font-size: 14px;">
+                        </div>
+                        <button onclick="applyFilters()" style="padding: 8px 16px; border-radius: 6px; border: none; background: var(--accent-blue); color: white; font-size: 14px; font-weight: 500; cursor: pointer;">Apply Filters</button>
+                        <button onclick="clearFilters()" style="padding: 8px 16px; border-radius: 6px; border: 1px solid var(--border-color); background: transparent; color: var(--text-primary); font-size: 14px; font-weight: 500; cursor: pointer;">Clear</button>
+                        <button onclick="loadAllHistory()" style="padding: 8px 16px; border-radius: 6px; border: 1px solid var(--border-color); background: transparent; color: var(--text-primary); font-size: 14px; font-weight: 500; cursor: pointer;">Load All History</button>
+                    </div>
                     <div id="closed-loading" class="loading">
                         <div class="spinner"></div>
                         <p>Loading trade history...</p>
@@ -515,20 +529,27 @@
             }
         }
 
-        async function loadClosedTrades() {
+        async function loadClosedTrades(startDate = null, endDate = null, limit = 100) {
             const loadingEl = document.getElementById('closed-loading');
             const tableEl = document.getElementById('closed-table');
             const emptyEl = document.getElementById('closed-empty');
             const bodyEl = document.getElementById('closed-body');
 
             try {
-                const response = await fetch('/api/v1/history/trades?limit=100&status=filled');
+                // Build query parameters
+                let queryParams = `limit=${limit}&status=filled`;
+                if (startDate) queryParams += `&start_date=${startDate}`;
+                if (endDate) queryParams += `&end_date=${endDate}`;
+
+                const response = await fetch(`/api/v1/history/trades?${queryParams}`);
                 const data = await response.json();
 
                 if (data.trades && data.trades.length > 0) {
                     bodyEl.innerHTML = data.trades.map(trade => {
                         const pnl = parseFloat(trade.realized_pnl || 0);
-                        const pnlPct = parseFloat(trade.r_multiple || 0);
+                        // Calculate P&L percentage: (P&L / Total Cost) * 100
+                        const totalCost = parseFloat(trade.entry_price || 0) * parseInt(trade.quantity || 0);
+                        const pnlPct = totalCost > 0 ? (pnl / totalCost) * 100 : 0;
                         const isWinner = trade.is_winner;
 
                         return `
@@ -541,8 +562,8 @@
                                 <td class="${pnl >= 0 ? 'positive' : 'negative'}">
                                     ${pnl >= 0 ? '+' : ''}$${Math.abs(pnl).toFixed(2)}
                                 </td>
-                                <td class="${pnl >= 0 ? 'positive' : 'negative'}">
-                                    ${pnl >= 0 ? '+' : ''}${pnlPct.toFixed(2)}%
+                                <td class="${pnlPct >= 0 ? 'positive' : 'negative'}">
+                                    ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}%
                                 </td>
                                 <td>${new Date(trade.entry_time).toLocaleString('en-US', {
                                     month: 'short',
@@ -625,6 +646,30 @@
                 loadingEl.style.display = 'none';
                 emptyEl.style.display = 'block';
             }
+        }
+
+        // Date filter functions
+        function applyFilters() {
+            const startDate = document.getElementById('start-date').value;
+            const endDate = document.getElementById('end-date').value;
+            loadClosedTrades(startDate, endDate, 500); // Load more when filtering
+        }
+
+        function clearFilters() {
+            document.getElementById('start-date').value = '';
+            document.getElementById('end-date').value = '';
+            loadClosedTrades(null, null, 100); // Back to default
+        }
+
+        function loadAllHistory() {
+            // Set start date to 1 year ago
+            const oneYearAgo = new Date();
+            oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
+            const startDate = oneYearAgo.toISOString().split('T')[0];
+
+            document.getElementById('start-date').value = startDate;
+            document.getElementById('end-date').value = '';
+            loadClosedTrades(startDate, null, 1000); // Load up to 1000 trades
         }
     </script>
 </body>

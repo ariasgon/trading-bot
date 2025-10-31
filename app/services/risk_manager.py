@@ -257,14 +257,29 @@ class RiskManagerService:
             }
     
     def get_open_positions_count(self) -> int:
-        """Get the number of currently open positions."""
+        """
+        Get the number of currently open BOT-MANAGED positions.
+
+        IMPORTANT: Only counts positions opened and managed by this bot (tracked in database).
+        Does NOT count manual positions opened outside the bot to avoid false limit hits.
+        """
         try:
+            # Use database as primary source - only bot-managed positions are tracked here
             with get_db_session() as db:
                 count = db.query(Position).filter(Position.status == 'open').count()
+                logger.debug(f"Open bot-managed positions count: {count}")
                 return count
         except Exception as e:
-            logger.error(f"Error getting open positions count: {e}")
-            return 0
+            logger.error(f"Error getting bot-managed positions count from database: {e}")
+            # Fallback to Alpaca count if database fails (less accurate as it includes manual positions)
+            try:
+                alpaca_positions = order_manager.get_open_positions()
+                count = len(alpaca_positions) if alpaca_positions else 0
+                logger.warning(f"Using Alpaca fallback count (includes manual positions): {count}")
+                return count
+            except Exception as alpaca_error:
+                logger.error(f"Alpaca fallback also failed: {alpaca_error}")
+                return 0
     
     def get_existing_position(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Check if we already have a position in this symbol."""
@@ -298,10 +313,11 @@ class RiskManagerService:
                 today = date.today()
                 
                 # Get today's completed trades
+                # Use enum value string to avoid SQLAlchemy enum issues
                 trades = db.query(Trade).filter(
                     Trade.entry_time >= datetime.combine(today, datetime.min.time()),
                     Trade.entry_time < datetime.combine(today, datetime.min.time()) + timedelta(days=1),
-                    Trade.status == TradeStatus.FILLED,
+                    Trade.status == 'filled',  # Use string value directly
                     Trade.realized_pnl.is_not(None)
                 ).all()
                 

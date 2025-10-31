@@ -826,11 +826,8 @@
                     pnlChange.className = pnlPercent >= 0 ? 'card-change positive' : 'card-change negative';
                 }
 
-                // Update active positions count
-                const positionsInfo = document.getElementById('positions-info');
-                if (positionsInfo && data.positions_count !== undefined) {
-                    positionsInfo.textContent = `${data.positions_count} open`;
-                }
+                // Active positions count is updated by loadPositions() function
+                // to ensure consistency with the positions table
             } catch (error) {
                 console.error('Error loading account info:', error);
             }
@@ -907,10 +904,14 @@
                 const response = await fetch('/api/v1/bot/active-positions');
                 const data = await response.json();
 
-                if (data.count > 0 && data.positions) {
-                    bodyEl.innerHTML = data.positions.map(pos => {
-                        const pnl = parseFloat(pos.unrealized_pnl || 0);
-                        const pnlPct = parseFloat(pos.unrealized_pnl_percent || 0);
+                // Convert active_positions object to array
+                const positionsArray = data.active_positions ? Object.values(data.active_positions) : [];
+                const positionCount = data.position_count || 0;
+
+                if (positionCount > 0 && positionsArray.length > 0) {
+                    bodyEl.innerHTML = positionsArray.map(pos => {
+                        const pnl = parseFloat(pos.unrealized_pl || pos.unrealized_pnl || 0);
+                        const pnlPct = parseFloat(pos.unrealized_plpc || pos.unrealized_pnl_percent || 0) * 100;
 
                         return `
                             <tr>
@@ -920,7 +921,7 @@
                                 <td>$${parseFloat(pos.entry_price || 0).toFixed(2)}</td>
                                 <td>$${parseFloat(pos.current_price || 0).toFixed(2)}</td>
                                 <td class="${pnl >= 0 ? 'positive' : 'negative'}">
-                                    $${Math.abs(pnl).toFixed(2)}
+                                    ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}
                                 </td>
                                 <td class="${pnlPct >= 0 ? 'positive' : 'negative'}">
                                     ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}%
@@ -932,8 +933,9 @@
                     loadingEl.style.display = 'none';
                     tableEl.style.display = 'table';
                     emptyEl.style.display = 'none';
-                    document.getElementById('positions-count').textContent = `${data.count} positions`;
-                    document.getElementById('active-positions').textContent = data.count;
+                    document.getElementById('positions-count').textContent = `${positionCount} positions`;
+                    document.getElementById('active-positions').textContent = positionCount;
+                    document.getElementById('positions-info').textContent = `${positionCount} open`;
                 } else {
                     loadingEl.style.display = 'none';
                     tableEl.style.display = 'none';
@@ -1021,9 +1023,19 @@
 
                 if (data.logs && data.logs.length > 0) {
                     const analysisLog = document.getElementById('analysis-log');
-                    analysisLog.innerHTML = data.logs.map(log =>
-                        `<div style="color: ${log.type === 'opportunity' ? 'var(--profit-green)' : 'var(--text-secondary)'};">${log.message}</div>`
-                    ).join('');
+                    analysisLog.innerHTML = data.logs.map(log => {
+                        // Format timestamp to show HH:MM:SS
+                        const timestamp = log.timestamp ? new Date(log.timestamp).toLocaleTimeString('en-US', {
+                            hour12: false,
+                            hour: '2-digit',
+                            minute: '2-digit',
+                            second: '2-digit'
+                        }) : '';
+                        const timeStr = timestamp ? `<span style="color: var(--text-secondary); font-size: 11px;">[${timestamp}]</span> ` : '';
+                        const symbol = log.symbol ? `<span style="color: var(--accent-blue); font-weight: 600;">[${log.symbol}]</span> ` : '';
+                        const color = log.type === 'opportunity' ? 'var(--profit-green)' : 'var(--text-white)';
+                        return `<div style="color: ${color};">${timeStr}${symbol}${log.message}</div>`;
+                    }).join('');
                 }
             } catch (error) {
                 console.error('Error loading analysis data:', error);

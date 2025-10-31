@@ -43,7 +43,7 @@ class Trade(Base):
     alpaca_order_id = Column(String(50), nullable=True)  # Alpaca's order ID
     
     # Trade details
-    side = Column(Enum(TradeSide), nullable=False)
+    side = Column(String(10), nullable=False)  # Changed from Enum to String for flexibility
     quantity = Column(Integer, nullable=False)
     
     # Prices
@@ -53,7 +53,7 @@ class Trade(Base):
     target_price = Column(Numeric(10, 4), nullable=True)
     
     # Status and P&L
-    status = Column(Enum(TradeStatus), nullable=False, default=TradeStatus.PENDING)
+    status = Column(String(20), nullable=False, default='pending')  # Changed from Enum to String for flexibility
     realized_pnl = Column(Numeric(15, 2), default=0.0)
     unrealized_pnl = Column(Numeric(15, 2), default=0.0)
     
@@ -95,7 +95,7 @@ class Trade(Base):
     def gross_pnl(self) -> float:
         """Calculate gross P&L (before commissions)."""
         if self.entry_price and self.exit_price and self.quantity:
-            if self.side == TradeSide.BUY:
+            if self.side == 'buy':
                 return (float(self.exit_price) - float(self.entry_price)) * self.quantity
             else:  # SHORT
                 return (float(self.entry_price) - float(self.exit_price)) * self.quantity
@@ -112,7 +112,7 @@ class Trade(Base):
         """Update trade with exit information."""
         self.exit_price = exit_price
         self.exit_time = exit_time or datetime.now()
-        self.status = TradeStatus.FILLED
+        self.status = 'filled'
         
         # Calculate realized P&L
         self.realized_pnl = self.gross_pnl

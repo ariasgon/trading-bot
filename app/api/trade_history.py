@@ -52,10 +52,7 @@ async def get_trade_history(
             if start_date:
                 start_dt = datetime.strptime(start_date, "%Y-%m-%d")
                 query = query.filter(Trade.entry_time >= start_dt)
-            else:
-                # Default: show trades from last 90 days if no filter specified
-                default_start = datetime.now() - timedelta(days=90)
-                query = query.filter(Trade.entry_time >= default_start)
+            # Note: No default date filter - show all trades unless user specifies dates
 
             if end_date:
                 end_dt = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)

@@ -18,16 +18,22 @@ class Settings(BaseSettings):
     log_level: str = Field(default="INFO", env="LOG_LEVEL")
     
     # Database
-    database_url: str = Field(env="DATABASE_URL")
+    database_url: str = Field(default="postgresql://trading_user:secure_password_123@localhost/trading_bot", env="DATABASE_URL")
     
     # Redis
-    redis_url: str = Field(env="REDIS_URL")
+    redis_url: str = Field(default="redis://localhost:6379", env="REDIS_URL")
     
-    # Alpaca API
-    alpaca_api_key: str = Field(env="ALPACA_API_KEY")
-    alpaca_secret_key: str = Field(env="ALPACA_SECRET_KEY")
-    alpaca_base_url: str = Field(env="ALPACA_BASE_URL")
-    alpaca_data_url: str = Field(env="ALPACA_DATA_URL")
+    # Alpaca API (Legacy - for market data)
+    alpaca_api_key: str = Field(default="", env="ALPACA_API_KEY")
+    alpaca_secret_key: str = Field(default="", env="ALPACA_SECRET_KEY")
+    alpaca_base_url: str = Field(default="https://paper-api.alpaca.markets", env="ALPACA_BASE_URL")
+    alpaca_data_url: str = Field(default="https://data.alpaca.markets", env="ALPACA_DATA_URL")
+
+    # Alpaca Broker API (for bracket orders with stop loss + take profit)
+    alpaca_broker_api_url: str = Field(default="https://broker-api.sandbox.alpaca.markets", env="ALPACA_BROKER_API_URL")
+    alpaca_broker_email: str = Field(default="", env="ALPACA_BROKER_EMAIL")
+    alpaca_broker_password: str = Field(default="", env="ALPACA_BROKER_PASSWORD")
+    alpaca_broker_account_id: str = Field(default="", env="ALPACA_BROKER_ACCOUNT_ID")
     
     # Risk Management
     max_risk_per_trade: float = Field(default=0.01, env="MAX_RISK_PER_TRADE")
@@ -69,9 +75,7 @@ class Settings(BaseSettings):
     # Bot Selection
     active_bot_mode: str = Field(default="stock", env="ACTIVE_BOT_MODE")  # 'stock', 'crypto', 'both'
     
-    class Config:
-        env_file = ".env"
-        case_sensitive = False
+    model_config = {"env_file": ".env", "case_sensitive": False, "extra": "allow"}
 
 
 # Create global settings instance

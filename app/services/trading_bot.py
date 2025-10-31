@@ -11,19 +11,19 @@ from contextlib import asynccontextmanager
 
 from app.core.config import settings
 from app.core.cache import redis_cache
-from app.strategies.velez_strategy import velez_strategy
 from app.services.market_data import market_data_service
 from app.services.order_manager import order_manager
 from app.services.portfolio import portfolio_service
 from app.services.risk_manager import risk_manager
+from app.services.analysis_logger import analysis_logger
 
 logger = logging.getLogger(__name__)
 
 
 class TradingBotEngine:
     """
-    Main trading bot engine implementing Oliver Velez methodology.
-    
+    Main trading bot engine using Proprietary Strategy.
+
     Orchestrates all components to run autonomous trading operations.
     """
     
@@ -33,17 +33,25 @@ class TradingBotEngine:
         self.current_watchlist = []
         self.active_positions = {}
         self.daily_stats = {}
-        
+
+        # Import strategy
+        from app.strategies.proprietary_strategy import proprietary_strategy
+
+        # Use proprietary strategy (MACD + Volume + RSI)
+        self.active_strategy = proprietary_strategy
+        self.strategy_name = "proprietary"
+
         # Trading session state
         self.session_start_time = None
         self.last_scan_time = None
         self.trades_today = 0
-        self.max_trades_per_day = 10
-        
+        self.base_max_trades_per_day = 10  # Base limit when PnL is neutral/negative
+        self.max_trades_when_profitable = 20  # Increased limit when daily PnL is positive
+
         # Error tracking
         self.error_count = 0
         self.max_errors_before_stop = 5
-        
+
         # Analysis logging
         self.analysis_logs = []
         self.max_analysis_logs = 100
@@ -54,8 +62,12 @@ class TradingBotEngine:
         try:
             logger.info("🚀 Starting Trading Bot Engine...")
             
-            # Initialize all services
+            # Initialize all services first
             await self._initialize_services()
+            
+            # CRITICAL: Initialize stock analysis watchlist FIRST
+            logger.info("🔍 Initializing dynamic market scanner and watchlist...")
+            await self._initialize_watchlist()
             
             # Set up scheduled tasks
             self._schedule_tasks()
@@ -101,17 +113,62 @@ class TradingBotEngine:
                 'portfolio': portfolio_service.health_check(),
                 'risk_manager': risk_manager.health_check()
             }
-            
+
             failed_services = [name for name, status in services_status.items() if not status]
-            
+
             if failed_services:
                 raise Exception(f"Failed services: {failed_services}")
-            
+
             logger.info("✅ All services initialized successfully")
-            
+
+            # Initialize active strategy
+            logger.info(f"Initializing {self.strategy_name.upper()} trading strategy...")
+            strategy_initialized = await self.active_strategy.initialize_strategy()
+            if not strategy_initialized:
+                logger.warning(f"{self.strategy_name} strategy initialization returned False, but continuing...")
+            else:
+                logger.info(f"✅ {self.strategy_name.upper()} strategy initialized and activated")
+
         except Exception as e:
             logger.error(f"Service initialization failed: {e}")
             raise
+    
+    async def _initialize_watchlist(self):
+        """Initialize stock analysis watchlist using dynamic market scanner."""
+        try:
+            logger.info("🔍 DYNAMIC SCANNER: Building initial watchlist from S&P 500 + NASDAQ...")
+            
+            # Use the dynamic market scanner to build watchlist
+            self.current_watchlist = await portfolio_service.get_watchlist()
+            
+            if self.current_watchlist and len(self.current_watchlist) > 0:
+                logger.info(f"✅ INITIAL WATCHLIST: {len(self.current_watchlist)} gappers found")
+                logger.info(f"📊 TOP SYMBOLS: {', '.join(self.current_watchlist[:5])}")
+                
+                # Log to analysis log for visibility
+                self.add_analysis_log(f"Dynamic scanner initialized: {len(self.current_watchlist)} gappers found", "success")
+                self.add_analysis_log(f"Top gappers: {', '.join(self.current_watchlist[:5])}", "info")
+                
+                # CRITICAL: Auto-activate trading session after successful watchlist initialization
+                logger.info("🚀 Auto-activating trading session to start opportunity monitoring...")
+                self.is_trading_active = True
+                self.add_analysis_log("Trading session activated - monitoring for opportunities", "success")
+                
+            else:
+                logger.warning("⚠️ No gappers found in initial scan, using fallback")
+                self.add_analysis_log("No significant gappers found in market scan", "warning")
+                
+        except Exception as e:
+            logger.error(f"Error initializing watchlist: {e}")
+            # Use fallback list if scanner fails
+            # Expanded fallback watchlist (30 stocks)
+            self.current_watchlist = [
+                "AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "META", "NVDA", "NFLX", "AMD", "CRM",
+                "COIN", "RBLX", "HOOD", "SOFI", "SHOP", "SQ", "UBER",
+                "MRNA", "BNTX", "PFE", "JPM", "BAC", "GS",
+                "MARA", "RIOT", "SOXL", "TQQQ", "SPXL", "SPY", "QQQ"
+            ]
+            self.add_analysis_log(f"Watchlist scanner error, using fallback: {e}", "error")
     
     def _schedule_tasks(self):
         """Schedule daily trading tasks."""
@@ -138,13 +195,26 @@ class TradingBotEngine:
                 
                 # If trading is active, run trading logic
                 if self.is_trading_active:
-                    await self._trading_cycle()
+                    try:
+                        # Add timeout to prevent hanging
+                        await asyncio.wait_for(self._trading_cycle(), timeout=60)  # 60-second timeout
+                    except asyncio.TimeoutError:
+                        logger.warning("Trading cycle timeout - continuing with next cycle")
+                        self.add_analysis_log("Trading cycle timeout - continuing", "warning")
+                    except Exception as cycle_error:
+                        logger.error(f"Trading cycle error: {cycle_error}")
+                        self.add_analysis_log(f"Trading cycle error: {str(cycle_error)}", "error")
                 
                 # Position monitoring (always active during market hours)
-                await self._monitor_positions()
-                
-                # Brief pause to prevent excessive CPU usage
-                await asyncio.sleep(3)  # 3-second cycle for more frequent analysis
+                try:
+                    await asyncio.wait_for(self._monitor_positions(), timeout=30)  # 30-second timeout
+                except asyncio.TimeoutError:
+                    logger.warning("Position monitoring timeout - continuing")
+                except Exception as monitor_error:
+                    logger.error(f"Position monitoring error: {monitor_error}")
+
+                # Pause between analysis cycles - run every minute
+                await asyncio.sleep(60)  # 60-second cycle (1 minute) for trade analysis
                 
             except Exception as e:
                 logger.error(f"Error in main loop: {e}")
@@ -158,36 +228,52 @@ class TradingBotEngine:
                 await asyncio.sleep(30)  # Longer pause after error
     
     async def _run_premarket_scan(self):
-        """Run pre-market scanning and preparation."""
+        """Run pre-market scanning and preparation using dynamic market scanner."""
         try:
-            logger.info("🌅 Running pre-market scan...")
-            
-            # Run pre-market scan using velez strategy
-            candidates = await velez_strategy.run_pre_market_scan()
-            
-            # Build today's watchlist (top 10 candidates)
-            self.current_watchlist = [c.symbol for c in candidates[:10]] if candidates else []
-            
+            logger.info("🌅 Running pre-market scan with dynamic market scanner...")
+
+            # Use the dynamic market scanner to find gappers
+            # This calls portfolio_service.get_watchlist() which calls market_scanner.scan_for_gappers()
+            self.current_watchlist = await portfolio_service.get_watchlist()
+
+            if not self.current_watchlist or len(self.current_watchlist) == 0:
+                logger.warning("⚠️ Market scanner found no gappers, using fallback list")
+                # Expanded fallback watchlist (30 stocks)
+            self.current_watchlist = [
+                "AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "META", "NVDA", "NFLX", "AMD", "CRM",
+                "COIN", "RBLX", "HOOD", "SOFI", "SHOP", "SQ", "UBER",
+                "MRNA", "BNTX", "PFE", "JPM", "BAC", "GS",
+                "MARA", "RIOT", "SOXL", "TQQQ", "SPXL", "SPY", "QQQ"
+            ]
+
             # Cache watchlist
             redis_cache.set("daily_watchlist", self.current_watchlist, expiration=28800)  # 8 hours
-            
+
             # Initialize daily stats
             self.daily_stats = {
                 'scan_time': datetime.now(),
-                'candidates_found': len(candidates) if candidates else 0,
+                'candidates_found': len(self.current_watchlist),
                 'watchlist_size': len(self.current_watchlist),
                 'trades_planned': 0,
                 'trades_executed': 0
             }
-            
+
             self.last_scan_time = datetime.now()
-            
-            logger.info(f"✅ Pre-market scan complete. Watchlist: {self.current_watchlist}")
-            
+
+            logger.info(f"✅ Pre-market scan complete. Watchlist: {len(self.current_watchlist)} stocks - {self.current_watchlist[:5]}")
+
         except Exception as e:
             logger.error(f"Pre-market scan failed: {e}")
-            # Use default watchlist on failure
-            self.current_watchlist = portfolio_service.get_watchlist()[:10]
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            # Use fallback watchlist on failure
+            # Expanded fallback watchlist (30 stocks)
+            self.current_watchlist = [
+                "AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "META", "NVDA", "NFLX", "AMD", "CRM",
+                "COIN", "RBLX", "HOOD", "SOFI", "SHOP", "SQ", "UBER",
+                "MRNA", "BNTX", "PFE", "JPM", "BAC", "GS",
+                "MARA", "RIOT", "SOXL", "TQQQ", "SPXL", "SPY", "QQQ"
+            ]
     
     async def _smart_premarket_scan(self):
         """Smart pre-market scan with time validation."""
@@ -223,7 +309,7 @@ class TradingBotEngine:
             # Get default watchlist if no current watchlist
             if not self.current_watchlist:
                 from app.services.portfolio import portfolio_service
-                symbols_to_analyze = portfolio_service.get_watchlist()
+                symbols_to_analyze = await portfolio_service.get_watchlist()
             else:
                 symbols_to_analyze = self.current_watchlist
             
@@ -259,7 +345,7 @@ class TradingBotEngine:
                 # Keep existing watchlist if no new candidates
                 if not self.current_watchlist:
                     from app.services.portfolio import portfolio_service
-                    self.current_watchlist = portfolio_service.get_watchlist()[:10]
+                    self.current_watchlist = await portfolio_service.get_watchlist()
             
             # Cache results
             redis_cache.set("daily_watchlist", self.current_watchlist, expiration=28800)
@@ -363,13 +449,6 @@ class TradingBotEngine:
     async def _trading_cycle(self):
         """Execute one trading cycle - scan for opportunities and execute trades."""
         try:
-            # Check if we should still be trading
-            from app.strategies.velez_strategy import MarketSession
-            current_session = velez_strategy._get_market_session()
-            if current_session != MarketSession.REGULAR_HOURS:
-                self.add_analysis_log(f"Market session is {current_session.value} - trading paused", "info")
-                return
-            
             # Check risk limits
             account_info = order_manager.get_account_info()
             account_equity = account_info.get('equity', 100000)
@@ -381,23 +460,45 @@ class TradingBotEngine:
                 self.is_trading_active = False
                 return
             
-            # Don't trade if we've hit daily trade limit
-            if self.trades_today >= self.max_trades_per_day:
-                self.add_analysis_log(f"Daily trade limit reached ({self.max_trades_per_day} trades)", "info")
-                logger.info(f"Daily trade limit reached ({self.max_trades_per_day})")
+            # Don't trade if we've hit daily trade limit (dynamic based on PnL)
+            max_trades_today = self.get_dynamic_trade_limit()
+            if self.trades_today >= max_trades_today:
+                self.add_analysis_log(f"Daily trade limit reached ({self.trades_today}/{max_trades_today} trades)", "info")
+                logger.info(f"Daily trade limit reached ({self.trades_today}/{max_trades_today})")
                 return
             
-            # Monitor active setups for entry signals
+            # STEP 1: Find new gap setups from watchlist (this was missing!)
             if self.current_watchlist:
                 self.add_analysis_log(f"Scanning {len(self.current_watchlist)} symbols for entry signals...", "info")
-                signals = await velez_strategy.monitor_active_setups()
                 
-                # Execute best signal if available
+                # First, analyze watchlist for new gap setups
+                await self._analyze_watchlist_for_setups()
+                
+                # Then, monitor existing setups for entry signals  
+                signals = await self.active_strategy.monitor_active_setups()
+                
+                # Execute best signals if available (process up to 3 per cycle)
                 if signals:
                     self.add_analysis_log(f"Found {len(signals)} potential entry signals", "success")
-                    for signal_data in signals[:1]:  # Process one signal at a time
+
+                    # Get current position count from Alpaca (source of truth for actual open positions)
+                    current_positions = risk_manager.get_open_positions_count()
+                    max_positions = settings.max_concurrent_positions
+
+                    signals_processed = 0
+                    for signal_data in signals[:3]:  # Process top 3 signals per cycle (increased from 1)
+                        # Check if we've hit position limit
+                        if current_positions >= max_positions:
+                            self.add_analysis_log(f"Max position limit reached ({current_positions}/{max_positions}) - skipping remaining signals", "warning")
+                            break
+
                         if signal_data.get('action') == 'enter_trade':
                             await self._execute_signal(signal_data)
+                            signals_processed += 1
+                            current_positions += 1  # Increment for next check
+
+                    if signals_processed > 0:
+                        self.add_analysis_log(f"Processed {signals_processed} signal(s) this cycle", "success")
                 else:
                     self.add_analysis_log("No entry signals found this cycle", "info")
             else:
@@ -407,7 +508,9 @@ class TradingBotEngine:
             self.last_analysis_time = datetime.now()
             
         except Exception as e:
+            import traceback
             logger.error(f"Trading cycle error: {e}")
+            logger.error(f"Full traceback: {traceback.format_exc()}")
             self.add_analysis_log(f"Trading cycle error: {str(e)}", "error")
             self.error_count += 1
     
@@ -418,24 +521,30 @@ class TradingBotEngine:
             symbol = setup.symbol
             
             logger.info(f"🎯 Executing {setup.signal_type} signal for {symbol}")
+
+            # Handle different target naming (target_price vs target_1)
+            target_price = getattr(setup, 'target_price', getattr(setup, 'target_1', 0))
+
             self.add_analysis_log(
-                f"Executing {setup.signal_type} signal - Entry: ${setup.entry_price:.2f}, Stop: ${setup.stop_loss:.2f}, Target: ${setup.target_price:.2f}",
+                f"Executing {setup.signal_type} signal - Entry: ${setup.entry_price:.2f}, Stop: ${setup.stop_loss:.2f}, Target: ${target_price:.2f}",
                 "success", symbol
             )
             
             # Execute trade signal using velez strategy
-            trade_id = await velez_strategy.execute_trade_signal(signal_data)
+            trade_id = await self.active_strategy.execute_trade_signal(signal_data)
             
             if trade_id:
                 logger.info(f"✅ Trade executed for {symbol}: {trade_id}")
                 self.add_analysis_log(f"Trade executed successfully (ID: {trade_id})", "success", symbol)
                 
                 # Track the position
+                target_price = getattr(setup, 'target_price', getattr(setup, 'target_1', 0))
+
                 self.active_positions[symbol] = {
                     'trade_id': trade_id,
                     'entry_price': setup.entry_price,
                     'stop_loss': setup.stop_loss,
-                    'target_price': setup.target_price,
+                    'target_price': target_price,
                     'position_size': setup.position_size,
                     'entry_time': datetime.now(),
                     'setup_data': setup
@@ -447,8 +556,16 @@ class TradingBotEngine:
                 self.add_analysis_log("Trade execution failed", "error", symbol)
                 
         except Exception as e:
-            logger.error(f"Signal execution error for {signal_data.get('setup', {}).get('symbol', 'unknown')}: {e}")
-            symbol = signal_data.get('setup', {}).get('symbol', 'unknown')
+            # Handle TradeSetup object (not a dict) - extract symbol safely
+            import traceback
+            try:
+                setup = signal_data.get('setup')
+                symbol = setup.symbol if setup and hasattr(setup, 'symbol') else 'unknown'
+            except:
+                symbol = 'unknown'
+
+            logger.error(f"Signal execution error for {symbol}: {e}")
+            logger.error(f"Full traceback: {traceback.format_exc()}")
             self.add_analysis_log(f"Signal execution error: {str(e)}", "error", symbol)
     
     async def _monitor_positions(self):
@@ -457,8 +574,8 @@ class TradingBotEngine:
             if not self.active_positions:
                 return
             
-            # Use velez strategy position management
-            actions = await velez_strategy.manage_open_positions()
+            # Use proprietary strategy position management
+            actions = await self.active_strategy.monitor_positions()
             
             if actions:
                 logger.info(f"Position management actions: {len(actions)}")
@@ -556,6 +673,94 @@ class TradingBotEngine:
         except Exception as e:
             logger.error(f"Error updating daily stats: {e}")
     
+    async def _analyze_watchlist_for_setups(self):
+        """Analyze current watchlist for new gap trading setups."""
+        try:
+            if not self.current_watchlist:
+                return
+            
+            from app.services.market_data import market_data_service
+            
+            gap_threshold = 0.75  # 0.75% minimum gap (matches proprietary strategy)
+            new_setups_found = 0
+            
+            for symbol in self.current_watchlist:
+                try:
+                    # Get comprehensive quote data
+                    quote_data = market_data_service.get_quote(symbol)
+                    if not quote_data:
+                        continue
+                    
+                    gap_percent = abs(quote_data.get('gap_percent', 0))
+                    premarket_gap_percent = abs(quote_data.get('premarket_gap_percent', 0))
+                    
+                    # Check if this symbol has a significant gap
+                    if gap_percent >= gap_threshold or premarket_gap_percent >= gap_threshold:
+                        # Create a gap setup for this symbol
+                        setup_created = await self._create_gap_setup(symbol, quote_data)
+                        if setup_created:
+                            new_setups_found += 1
+                            
+                except Exception as e:
+                    logger.warning(f"Error analyzing {symbol}: {e}")
+                    continue
+            
+            if new_setups_found > 0:
+                self.add_analysis_log(f"Created {new_setups_found} new gap setups from watchlist", "success")
+                logger.info(f"Created {new_setups_found} gap setups")
+            
+        except Exception as e:
+            logger.error(f"Error analyzing watchlist for setups: {e}")
+            self.add_analysis_log(f"Watchlist analysis error: {str(e)}", "error")
+    
+    async def _create_gap_setup(self, symbol: str, quote_data: dict) -> bool:
+        """Create a gap trading setup for a symbol."""
+        try:
+            current_price = quote_data.get('price', 0)
+            gap_percent = quote_data.get('gap_percent', 0)
+            premarket_gap_percent = quote_data.get('premarket_gap_percent', 0)
+            volume = quote_data.get('volume', 0)
+            
+            # Determine gap direction and strength
+            is_gap_up = gap_percent > 0 or premarket_gap_percent > 0
+            gap_strength = max(abs(gap_percent), abs(premarket_gap_percent))
+            
+            # Only create setups for significant gaps (volume will be checked by strategy)
+            if gap_strength < 0.75:
+                return False
+            
+            # Create setup data
+            setup_data = {
+                'symbol': symbol,
+                'setup_type': 'gap_up' if is_gap_up else 'gap_down',
+                'gap_percent': gap_percent,
+                'premarket_gap_percent': premarket_gap_percent,
+                'current_price': current_price,
+                'volume': volume,
+                'previous_close': quote_data.get('previous_close', current_price),
+                'premarket_price': quote_data.get('premarket_price', current_price),
+                'timestamp': datetime.now(),
+                'priority': gap_strength  # Higher gap = higher priority
+            }
+            
+            # Add the setup to velez strategy for monitoring
+            setup_added = await self.active_strategy.add_gap_setup(setup_data)
+            
+            if setup_added:
+                self.add_analysis_log(
+                    f"Gap setup created - {gap_strength:.1f}% gap, monitoring for entry signal",
+                    "success", 
+                    symbol
+                )
+                logger.info(f"Gap setup created for {symbol}: {gap_strength:.1f}% gap")
+                return True
+            
+        except Exception as e:
+            logger.error(f"Error creating gap setup for {symbol}: {e}")
+            self.add_analysis_log(f"Setup creation error for {symbol}: {str(e)}", "error", symbol)
+        
+        return False
+    
     def _calculate_session_duration(self) -> str:
         """Calculate trading session duration."""
         if self.session_start_time:
@@ -564,7 +769,30 @@ class TradingBotEngine:
             minutes, _ = divmod(remainder, 60)
             return f"{int(hours)}h {int(minutes)}m"
         return "Unknown"
-    
+
+    def get_dynamic_trade_limit(self) -> int:
+        """
+        Calculate dynamic trade limit based on daily PnL.
+
+        Returns more trades allowed when daily PnL is positive.
+        """
+        try:
+            # Get daily PnL
+            account_summary = portfolio_service.get_account_summary()
+            daily_pnl = account_summary.get('daily_pnl', 0)
+
+            if daily_pnl > 0:
+                # Positive PnL: Allow more trades (20 instead of 10)
+                logger.info(f"📈 Daily PnL is positive (${daily_pnl:.2f}) - increasing trade limit to {self.max_trades_when_profitable}")
+                return self.max_trades_when_profitable
+            else:
+                # Negative or neutral PnL: Use base limit
+                return self.base_max_trades_per_day
+
+        except Exception as e:
+            logger.error(f"Error calculating dynamic trade limit: {e}")
+            return self.base_max_trades_per_day  # Fallback to base limit
+
     def get_status(self) -> Dict[str, Any]:
         """Get current bot status."""
         return {
@@ -575,7 +803,8 @@ class TradingBotEngine:
             'trades_today': self.trades_today,
             'error_count': self.error_count,
             'session_start': self.session_start_time.isoformat() if self.session_start_time else None,
-            'last_scan': self.last_scan_time.isoformat() if self.last_scan_time else None
+            'last_scan': self.last_scan_time.isoformat() if self.last_scan_time else None,
+            'last_analysis': self.last_analysis_time.isoformat() if self.last_analysis_time else None
         }
     
     def add_analysis_log(self, message: str, log_type: str = "info", symbol: str = None):
@@ -592,6 +821,12 @@ class TradingBotEngine:
         # Keep only the last N logs to prevent memory issues
         if len(self.analysis_logs) > self.max_analysis_logs:
             self.analysis_logs = self.analysis_logs[-self.max_analysis_logs:]
+        
+        # Also add to the shared analysis logger for API access
+        try:
+            analysis_logger._add_log(log_type, message, symbol, analysis_logger._get_trading_time())
+        except Exception as e:
+            logger.error(f"Failed to add log to analysis_logger: {e}")
     
     def get_analysis_logs(self) -> List[Dict[str, Any]]:
         """Get recent analysis logs."""
@@ -622,33 +857,21 @@ class TradingBotEngine:
                         continue
                     
                     current_price = quote_data.get('price', 0)
+                    previous_close = quote_data.get('previous_close', 0)
+                    gap_percent = quote_data.get('gap_percent', 0)
                     volume = quote_data.get('volume', 0)
                     
-                    # Analyze using velez strategy
-                    setup_analysis = await velez_strategy.analyze_stock(symbol)
-                    
-                    if setup_analysis:
-                        setup_type = setup_analysis.get('setup_type', 'unknown')
-                        signal_strength = setup_analysis.get('signal_strength', 0)
-                        
-                        if signal_strength > 0.7:  # Strong signal
-                            self.add_analysis_log(
-                                f"Strong {setup_type} setup detected (strength: {signal_strength:.2f}) at ${current_price:.2f}",
-                                "success", symbol
-                            )
-                            setups_found += 1
-                        elif signal_strength > 0.5:  # Moderate signal
-                            self.add_analysis_log(
-                                f"Moderate {setup_type} setup (strength: {signal_strength:.2f}) at ${current_price:.2f}",
-                                "info", symbol
-                            )
-                        else:
-                            self.add_analysis_log(
-                                f"Weak setup detected (strength: {signal_strength:.2f}) - no action",
-                                "info", symbol
-                            )
-                    else:
-                        self.add_analysis_log(f"No setup detected - current price ${current_price:.2f}, volume {volume:,}", "info", symbol)
+                    # Check for significant gaps
+                    if abs(gap_percent) >= 2.0:  # 2% gap threshold
+                        gap_direction = "UP" if gap_percent > 0 else "DOWN"
+                        self.add_analysis_log(
+                            f"🚀 SIGNIFICANT GAP {gap_direction}: {gap_percent:.2f}% (${previous_close:.2f} → ${current_price:.2f})",
+                            "success", symbol
+                        )
+                        setups_found += 1
+
+                    gap_info = f", gap: {gap_percent:.2f}%" if abs(gap_percent) > 0.5 else ""
+                    self.add_analysis_log(f"Analyzed - price ${current_price:.2f}, volume {volume:,}{gap_info}", "info", symbol)
                     
                 except Exception as e:
                     self.add_analysis_log(f"Analysis error: {str(e)}", "error", symbol)
@@ -657,12 +880,38 @@ class TradingBotEngine:
             self.add_analysis_log(f"Analysis complete: {setups_found} strong setups found from {len(self.current_watchlist)} symbols")
             
             return {"setups_found": setups_found}
-            
+
         except Exception as e:
             logger.error(f"Force analysis error: {e}")
             self.add_analysis_log(f"Force analysis failed: {str(e)}", "error")
             return {"setups_found": 0}
 
+    def get_strategy_info(self) -> Dict[str, Any]:
+        """Get information about active strategy."""
+        return {
+            "active_strategy": self.strategy_name,
+            "is_active": self.active_strategy.is_active if hasattr(self.active_strategy, 'is_active') else False,
+            "strategy_description": "Gap + Volume + MACD + RSI strategy for long and short trades"
+        }
 
-# Create global trading bot instance
-trading_bot = TradingBotEngine()
+
+# Global trading bot instance (lazy initialization to avoid circular imports)
+_trading_bot_instance = None
+
+def get_trading_bot():
+    """Get or create the global trading bot instance."""
+    global _trading_bot_instance
+    if _trading_bot_instance is None:
+        _trading_bot_instance = TradingBotEngine()
+    return _trading_bot_instance
+
+# For backward compatibility, create a property-like object
+class TradingBotProxy:
+    """Proxy object that lazily creates the trading bot instance."""
+    def __getattr__(self, name):
+        return getattr(get_trading_bot(), name)
+
+    def __setattr__(self, name, value):
+        return setattr(get_trading_bot(), name, value)
+
+trading_bot = TradingBotProxy()

@@ -1,12 +1,14 @@
 """
 Bot control API endpoints for managing the trading bot.
 """
+import logging
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from typing import Dict, Any
 from datetime import datetime
 
 from app.services.trading_bot import trading_bot
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -104,17 +106,6 @@ async def resume_trading():
                 "message": "Trading bot is not running"
             }
         
-        # Check if we should be trading now
-        from app.strategies.velez_strategy import velez_strategy, MarketSession
-        current_session = velez_strategy._get_market_session()
-        
-        if current_session != MarketSession.REGULAR_HOURS:
-            return {
-                "status": "cannot_resume",
-                "message": f"Cannot resume: Market is {current_session.value}",
-                "timestamp": datetime.now().isoformat()
-            }
-        
         trading_bot.is_trading_active = True
         
         return {
@@ -146,28 +137,55 @@ async def emergency_stop():
 
 @router.get("/active-positions")
 async def get_active_positions():
-    """Get currently active positions."""
+    """
+    Get currently active positions from Trading API.
+
+    Uses: Alpaca Trading API list_positions()
+    """
     try:
+        from app.services.order_manager import order_manager
+
+        # Get real positions from Trading API
+        api_positions = order_manager.get_open_positions()
+
         positions = {}
-        
-        for symbol, position_data in trading_bot.active_positions.items():
+
+        for pos in api_positions:
+            symbol = pos.get('symbol')
+            qty = pos.get('quantity', 0)
+            side = pos.get('side', 'long')
+
+            # Get additional data from bot tracking if available
+            bot_position_data = trading_bot.active_positions.get(symbol, {})
+
             positions[symbol] = {
-                'entry_price': position_data['entry_price'],
-                'stop_loss': position_data['stop_loss'],
-                'target_1': position_data['target_price'],
-                'quantity': position_data.get('position_size', 0),
-                'side': 'buy',  # Default to buy since we're only doing longs in Velez strategy
-                'entry_time': position_data['entry_time'].isoformat(),
-                'partial_profit_taken': position_data.get('partial_profit_taken', False)
+                'symbol': symbol,
+                'quantity': abs(qty),
+                'side': side,
+                'entry_price': pos.get('avg_entry_price', 0),
+                'current_price': pos.get('current_price', 0),
+                'market_value': pos.get('market_value', 0),
+                'unrealized_pl': pos.get('unrealized_pnl', 0),
+                'unrealized_plpc': pos.get('unrealized_pnl_percent', 0),  # Percent
+                'cost_basis': pos.get('cost_basis', 0),
+                # From bot tracking (if available)
+                'stop_loss': bot_position_data.get('stop_loss'),
+                'target_1': bot_position_data.get('target_price'),
+                'entry_time': bot_position_data.get('entry_time').isoformat() if bot_position_data.get('entry_time') else None,
+                'partial_profit_taken': bot_position_data.get('partial_profit_taken', False)
             }
-        
+
         return {
             "active_positions": positions,
             "position_count": len(positions),
+            "data_source": "trading_api",
             "timestamp": datetime.now().isoformat()
         }
-        
+
     except Exception as e:
+        logger.error(f"Error getting active positions: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Failed to get positions: {e}")
 
 
@@ -197,8 +215,8 @@ async def get_daily_stats():
 async def get_current_watchlist():
     """Get current trading watchlist."""
     try:
-        # Use mock market data service for enhanced watchlist display
-        from app.services.mock_enhanced_market_data import mock_enhanced_market_data
+        # Use REAL market data service instead of mock
+        from app.services.market_data import market_data_service
         
         if not trading_bot.current_watchlist:
             return {
@@ -208,20 +226,61 @@ async def get_current_watchlist():
                 "timestamp": datetime.now().isoformat()
             }
         
-        # Get enhanced market data using mock service
-        enhanced_data = await mock_enhanced_market_data.get_enhanced_watchlist_data(trading_bot.current_watchlist)
-        summary_data = await mock_enhanced_market_data.get_watchlist_summary(trading_bot.current_watchlist)
+        # Get COMPREHENSIVE market data for each symbol
+        watchlist_data = {}
+        for symbol in trading_bot.current_watchlist:
+            try:
+                # Get comprehensive quote data with OHLC
+                quote_data = market_data_service.get_quote(symbol)
+                if quote_data:
+                    watchlist_data[symbol] = {
+                        "symbol": symbol,
+                        "current_price": quote_data.get('price', 0),
+                        "previous_close": quote_data.get('previous_close', 0),
+                        "today_open": quote_data.get('today_open', 0),
+                        "premarket_price": quote_data.get('premarket_price', 0),
+                        "bid": quote_data.get('bid', 0),
+                        "ask": quote_data.get('ask', 0),
+                        "volume": quote_data.get('volume', 0),
+                        "gap_amount": quote_data.get('gap_amount', 0),
+                        "gap_percent": quote_data.get('gap_percent', 0),
+                        "premarket_gap": quote_data.get('premarket_gap', 0),
+                        "premarket_gap_percent": quote_data.get('premarket_gap_percent', 0),
+                        "gap_from_open": quote_data.get('gap_from_open', 0),
+                        "gap_open_percent": quote_data.get('gap_open_percent', 0),
+                        "timestamp": quote_data.get('timestamp', datetime.now().isoformat()),
+                        "data_source": "real_alpaca_ohlc_premarket_data"
+                    }
+                else:
+                    watchlist_data[symbol] = {
+                        "symbol": symbol,
+                        "error": "No market data available",
+                        "data_source": "alpaca_api_error"
+                    }
+            except Exception as e:
+                watchlist_data[symbol] = {
+                    "symbol": symbol,
+                    "error": str(e),
+                    "data_source": "api_exception"
+                }
+        
+        summary_data = {
+            "total_symbols": len(watchlist_data),
+            "symbols_with_data": len([s for s in watchlist_data.values() if "error" not in s]),
+            "data_source": "real_alpaca_api",
+            "last_updated": datetime.now().isoformat()
+        }
         
         return {
-            "watchlist": enhanced_data,
-            "count": len(enhanced_data),
+            "watchlist": watchlist_data,
+            "count": len(watchlist_data),
             "summary": summary_data,
             "symbols": trading_bot.current_watchlist,
             "timestamp": datetime.now().isoformat()
         }
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to get enhanced watchlist: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get real watchlist data: {e}")
 
 
 @router.post("/force-scan")
@@ -278,50 +337,57 @@ async def activate_trading_session():
 
 @router.post("/close-position/{symbol}")
 async def close_single_position(symbol: str):
-    """Close a specific position."""
+    """
+    Close a specific position using Trading API.
+
+    Uses: Alpaca Trading API to place offsetting market order
+    """
     try:
-        if symbol not in trading_bot.active_positions:
-            raise HTTPException(status_code=404, detail=f"No active position found for {symbol}")
-        
-        position_data = trading_bot.active_positions[symbol]
-        
-        # Close the position using portfolio service
-        from app.services.portfolio import portfolio_service
         from app.services.order_manager import order_manager
-        
-        # Get position details from portfolio service
-        open_positions = portfolio_service.get_open_positions()
-        target_position = None
-        
-        for pos in open_positions:
-            if pos['symbol'] == symbol:
-                target_position = pos
-                break
-        
-        if target_position:
-            quantity = abs(target_position['quantity'])
-            side = 'sell' if target_position['quantity'] > 0 else 'buy'
-            
-            order_id = order_manager.place_market_order(symbol, side, quantity)
-            
-            if order_id:
-                # Remove from active positions
-                del trading_bot.active_positions[symbol]
-                
-                return {
-                    "status": "position_closed",
-                    "symbol": symbol,
-                    "order_id": order_id,
-                    "timestamp": datetime.now().isoformat()
-                }
-            else:
-                raise HTTPException(status_code=500, detail="Failed to place closing order")
-        else:
+
+        # First get the position data from Trading API
+        position = order_manager.get_position(symbol)
+
+        if not position:
             raise HTTPException(status_code=404, detail=f"No open position found for {symbol}")
-        
+
+        # Log position details before closing
+        qty = position.get('quantity', 0)
+        market_value = position.get('market_value', 0)
+        current_price = position.get('current_price', 0)
+        unrealized_pl = position.get('unrealized_pnl', 0)
+
+        logger.info(f"Closing position: {symbol}")
+        logger.info(f"  Quantity: {qty}")
+        logger.info(f"  Current Price: ${current_price:.2f}")
+        logger.info(f"  Market Value: ${market_value:.2f}")
+        logger.info(f"  Unrealized P/L: ${unrealized_pl:.2f}")
+
+        # Close the position using Trading API
+        success = order_manager.close_position(symbol)
+
+        if success:
+            # Remove from active positions tracking
+            if symbol in trading_bot.active_positions:
+                del trading_bot.active_positions[symbol]
+
+            return {
+                "status": "position_closed",
+                "symbol": symbol,
+                "quantity": qty,
+                "market_value": market_value,
+                "unrealized_pl": unrealized_pl,
+                "timestamp": datetime.now().isoformat()
+            }
+        else:
+            raise HTTPException(status_code=500, detail="Failed to close position via Trading API")
+
     except HTTPException:
         raise
     except Exception as e:
+        logger.error(f"Error in close_single_position: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Failed to close position: {e}")
 
 
@@ -381,3 +447,42 @@ async def force_analysis():
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to force analysis: {e}")
+
+
+@router.get("/strategy/info")
+async def get_strategy_info():
+    """Get information about active trading strategy."""
+    try:
+        strategy_info = trading_bot.get_strategy_info()
+        return {
+            **strategy_info,
+            "timestamp": datetime.now().isoformat()
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get strategy info: {e}")
+
+
+@router.post("/strategy/switch/{strategy_name}")
+async def switch_strategy(strategy_name: str):
+    """
+    Switch between trading strategies.
+
+    Args:
+        strategy_name: Strategy to switch to ("proprietary" or "velez")
+    """
+    try:
+        result = await trading_bot.switch_strategy(strategy_name)
+
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result.get("message"))
+
+        return {
+            **result,
+            "timestamp": datetime.now().isoformat()
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to switch strategy: {e}")

@@ -45,10 +45,14 @@ class Position(Base):
     
     # P&L tracking
     unrealized_pnl = Column(Numeric(15, 2), default=0.0)
-    
+
     # Position management
     status = Column(Enum(PositionStatus), nullable=False, default=PositionStatus.OPEN, index=True)
-    
+
+    # Strategy metadata
+    strategy = Column(String(50), nullable=True)  # e.g., 'velez_gap_pullback'
+    setup_type = Column(String(50), nullable=True)  # e.g., 'gap_pullback', 'gap_bounce'
+
     # References
     trade_id = Column(UUID(as_uuid=True), ForeignKey("trades.id"), nullable=True)
     
