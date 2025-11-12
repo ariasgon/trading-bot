@@ -158,20 +158,30 @@ class OrderManagerService:
         stop_loss: float,
         take_profit: float,
         trade_id: str = None,
-        limit_price: Optional[float] = None
+        limit_price: Optional[float] = None,
+        use_trailing_stop: bool = True,
+        trail_percent: Optional[float] = None
     ) -> Optional[str]:
         """
-        Place a bracket order with entry, stop loss, and take profit using Trading API.
+        Place entry order with AUTOMATIC TRAILING STOP + TAKE PROFIT.
 
-        Uses OCO (One-Cancels-Other) order class which creates:
-        - Main order (entry) - market or limit based on limit_price parameter
-        - Stop loss order (triggered if price goes against you)
-        - Take profit order (triggered if price goes in your favor)
+        Implementation:
+        1. Place entry order (limit or market)
+        2. Monitor order fill asynchronously
+        3. Once filled, immediately place trailing stop + take profit as separate orders
 
-        When one is filled, the other is automatically cancelled.
+        This gives us trailing stops from entry using Alpaca's native trailing stop functionality.
 
         Args:
+            symbol: Stock symbol
+            side: 'buy' or 'sell'
+            quantity: Number of shares
+            stop_loss: Initial stop loss price (used to calculate trail distance)
+            take_profit: Take profit price
+            trade_id: Optional trade ID for tracking
             limit_price: If provided, uses limit order for entry. Otherwise uses market order.
+            use_trailing_stop: If True, uses trailing stop (default: True)
+            trail_percent: Deprecated parameter (not used - trail_price calculated from ATR)
         """
         try:
             if quantity <= 0:
@@ -190,34 +200,63 @@ class OrderManagerService:
             order_type = OrderType.LIMIT.value if limit_price is not None else OrderType.MARKET.value
             if limit_price is not None:
                 limit_price = round(limit_price, 2)
+                entry_price = limit_price
+            else:
+                # For market orders, estimate entry price from current quote
+                try:
+                    quote = self.api.get_latest_trade(symbol)
+                    entry_price = float(quote.price)
+                except:
+                    # Fallback: use stop_loss to estimate entry
+                    entry_price = stop_loss * 1.02 if side.lower() == 'buy' else stop_loss * 0.98
 
-            logger.info(f"🎯 Placing BRACKET ORDER ({order_type.upper()}): {side} {quantity} {symbol}")
+            # Calculate DOLLAR-BASED trailing stop (trail_price, not trail_percent)
+            trail_price_dollar = None
+            if use_trailing_stop:
+                # Calculate trail_price from stop_loss distance (ATR-based)
+                # Initial stop = 2x ATR, Trailing stop = 1.5x ATR (tighter for faster profit locking)
+                stop_distance = abs(entry_price - stop_loss)  # This is 2x ATR
+                trail_price_dollar = round(stop_distance * 0.75, 2)  # 75% of stop distance = 1.5x ATR
+
+            # Log what we're placing
+            logger.info(f"🎯 Placing ENTRY ORDER ({order_type.upper()}): {side} {quantity} {symbol}")
             if limit_price:
                 logger.info(f"   Entry Limit: ${limit_price:.2f}")
-            logger.info(f"   Stop Loss: ${stop_loss:.2f}, Take Profit: ${take_profit:.2f}")
+            logger.info(f"   Will place TRAILING STOP (${trail_price_dollar} trail) + TP (${take_profit:.2f}) after fill")
 
-            # Build order parameters
-            order_params = {
+            # STEP 1: Place ENTRY order (simple order, no legs)
+            entry_params = {
                 'symbol': symbol,
                 'qty': quantity,
                 'side': side.lower(),
                 'type': order_type,
-                'time_in_force': TimeInForce.DAY.value,
-                'order_class': 'bracket',  # This is the KEY parameter!
-                'stop_loss': {
-                    'stop_price': str(stop_loss)
-                },
-                'take_profit': {
-                    'limit_price': str(take_profit)
-                }
+                'time_in_force': TimeInForce.GTC.value,
             }
 
             # Add limit price if using limit order
             if limit_price is not None:
-                order_params['limit_price'] = str(limit_price)
+                entry_params['limit_price'] = str(limit_price)
 
-            # Place bracket order using Trading API
-            order = self.api.submit_order(**order_params)
+            # Place simple entry order
+            order = self.api.submit_order(**entry_params)
+
+            logger.info(f"✅ Entry order placed: {order.id}")
+            logger.info(f"   Monitoring for fill to place trailing stop + take profit...")
+
+            # STEP 2: Monitor for fill and place trailing stop + take profit
+            # This will be done asynchronously in a background task
+            import asyncio
+            asyncio.create_task(
+                self._place_trailing_stop_after_fill(
+                    order_id=order.id,
+                    symbol=symbol,
+                    quantity=quantity,
+                    side=side.lower(),
+                    trail_price=trail_price_dollar,
+                    take_profit=take_profit,
+                    trade_id=trade_id
+                )
+            )
 
             # Track the order
             order_data = {
@@ -225,11 +264,12 @@ class OrderManagerService:
                 "symbol": symbol,
                 "side": side.lower(),
                 "quantity": quantity,
-                "type": "bracket",
+                "type": "entry_with_trailing",  # Entry order, trailing stop + TP placed after fill
                 "order_type": order_type,
                 "limit_price": limit_price,
                 "stop_loss": stop_loss,
                 "take_profit": take_profit,
+                "trail_price": trail_price_dollar,
                 "status": order.status,
                 "submitted_at": datetime.now().isoformat(),
                 "trade_id": trade_id
@@ -238,21 +278,106 @@ class OrderManagerService:
             self.pending_orders[order.id] = order_data
             redis_cache.set(f"order:{order.id}", order_data, expiration=86400)
 
-            logger.info(f"✅ BRACKET ORDER PLACED: {order.id}")
-            logger.info(f"   Entry Order ID: {order.id} ({order_type.upper()})")
-            if limit_price:
-                logger.info(f"   Entry Limit: ${limit_price:.2f}")
-            logger.info(f"   Stop Loss: ${stop_loss:.2f}, Take Profit: ${take_profit:.2f}")
-
             return order.id
 
         except Exception as e:
-            logger.error(f"Error placing bracket order for {symbol}: {e}")
+            logger.error(f"❌ ERROR placing entry order for {symbol}: {e}")
+            logger.error(f"   Parameters: side={side}, qty={quantity}, entry={limit_price if limit_price else 'MARKET'}")
+            logger.error(f"   Stop loss: ${stop_loss}, Take profit: ${take_profit}")
+            if use_trailing_stop and trail_price_dollar:
+                logger.error(f"   Trail price: ${trail_price_dollar}")
             import traceback
-            logger.error(traceback.format_exc())
+            logger.error(f"Full traceback:\n{traceback.format_exc()}")
             return None
 
-    def place_stop_loss_order(self, symbol: str, quantity: int, stop_price: float, trade_id: str = None) -> Optional[str]:
+    async def _place_trailing_stop_after_fill(
+        self,
+        order_id: str,
+        symbol: str,
+        quantity: int,
+        side: str,
+        trail_price: float,
+        take_profit: float,
+        trade_id: str = None
+    ):
+        """
+        Monitor entry order for fill, then immediately place trailing stop + take profit.
+
+        Args:
+            order_id: Entry order ID to monitor
+            symbol: Stock symbol
+            quantity: Number of shares
+            side: Entry order side ('buy' or 'sell')
+            trail_price: Dollar amount for trailing stop
+            take_profit: Take profit price
+            trade_id: Associated trade ID
+        """
+        try:
+            import asyncio
+
+            logger.info(f"🔍 {symbol}: Monitoring order {order_id} for fill...")
+
+            # Poll order status until filled (max 60 seconds)
+            max_checks = 60
+            for i in range(max_checks):
+                try:
+                    order = self.api.get_order(order_id)
+
+                    if order.status == 'filled':
+                        logger.info(f"✅ {symbol}: Entry order FILLED! Placing trailing stop + take profit...")
+
+                        # Determine exit side (opposite of entry)
+                        exit_side = 'sell' if side == 'buy' else 'buy'
+
+                        # Place TRAILING STOP
+                        trailing_stop_id = self.place_trailing_stop(
+                            symbol=symbol,
+                            side=exit_side,
+                            quantity=quantity,
+                            trail_price=trail_price,
+                            trade_id=trade_id
+                        )
+
+                        if trailing_stop_id:
+                            logger.info(f"✅ {symbol}: Trailing stop placed: {trailing_stop_id}")
+                        else:
+                            logger.error(f"❌ {symbol}: Failed to place trailing stop!")
+
+                        # Place TAKE PROFIT
+                        tp_id = self.place_limit_order(
+                            symbol=symbol,
+                            side=exit_side,
+                            quantity=quantity,
+                            limit_price=take_profit,
+                            trade_id=trade_id
+                        )
+
+                        if tp_id:
+                            logger.info(f"✅ {symbol}: Take profit placed: {tp_id}")
+                        else:
+                            logger.error(f"❌ {symbol}: Failed to place take profit!")
+
+                        logger.info(f"🎯 {symbol}: Position fully protected with trailing stop + TP")
+                        return
+
+                    elif order.status in ['cancelled', 'expired', 'rejected']:
+                        logger.warning(f"⚠️ {symbol}: Entry order {order.status}, not placing stops")
+                        return
+
+                except Exception as e:
+                    logger.error(f"Error checking order status: {e}")
+
+                # Wait 1 second before next check
+                await asyncio.sleep(1)
+
+            logger.warning(f"⏰ {symbol}: Entry order not filled after {max_checks} seconds")
+
+        except Exception as e:
+            logger.error(f"Error in _place_trailing_stop_after_fill for {symbol}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
+    def place_stop_loss_order(self, symbol: str, quantity: int, stop_price: float, side: str = 'sell', trade_id: str = None) -> Optional[str]:
         """Place a stop-loss order."""
         try:
             if quantity <= 0 or stop_price <= 0:
@@ -262,22 +387,22 @@ class OrderManagerService:
             # Round price to 2 decimal places
             stop_price = round(stop_price, 2)
 
-            logger.info(f"Placing stop-loss order: sell {quantity} shares of {symbol} at ${stop_price}")
+            logger.info(f"Placing stop-loss order: {side} {quantity} shares of {symbol} at ${stop_price}")
 
             order = self.api.submit_order(
                 symbol=symbol,
                 qty=quantity,
-                side='sell',
+                side=side,
                 type=OrderType.STOP.value,
                 stop_price=stop_price,
-                time_in_force=TimeInForce.DAY.value
+                time_in_force=TimeInForce.GTC.value  # GTC so it doesn't expire
             )
             
             # Track the order
             order_data = {
                 "id": order.id,
                 "symbol": symbol,
-                "side": "sell",
+                "side": side,
                 "quantity": quantity,
                 "type": OrderType.STOP.value,
                 "stop_price": stop_price,
@@ -428,72 +553,6 @@ class OrderManagerService:
             logger.error(traceback.format_exc())
             return None
 
-    def get_order_legs(self, parent_order_id: str) -> Dict[str, Any]:
-        """
-        Get the legs (child orders) of a bracket order.
-
-        Args:
-            parent_order_id: The ID of the parent bracket order
-
-        Returns:
-            Dictionary with stop_loss_id, take_profit_id, and parent order info
-        """
-        try:
-            # Get order details with nested legs
-            order = self.api.get_order(parent_order_id)
-
-            result = {
-                'parent_id': parent_order_id,
-                'stop_loss_id': None,
-                'take_profit_id': None,
-                'parent_status': order.status
-            }
-
-            # Check if order has legs
-            if hasattr(order, 'legs') and order.legs:
-                for leg in order.legs:
-                    if hasattr(leg, 'order_type'):
-                        if leg.order_type == 'stop':
-                            result['stop_loss_id'] = leg.id
-                            logger.info(f"Found stop loss leg: {leg.id}")
-                        elif leg.order_type == 'limit':
-                            result['take_profit_id'] = leg.id
-                            logger.info(f"Found take profit leg: {leg.id}")
-
-            return result
-
-        except Exception as e:
-            logger.error(f"Error getting order legs for {parent_order_id}: {e}")
-            return {'parent_id': parent_order_id, 'stop_loss_id': None, 'take_profit_id': None}
-
-    def cancel_stop_loss_leg(self, parent_order_id: str) -> bool:
-        """
-        Cancel the stop loss leg of a bracket order.
-
-        Args:
-            parent_order_id: The ID of the parent bracket order
-
-        Returns:
-            True if successfully cancelled, False otherwise
-        """
-        try:
-            # Get the order legs
-            legs = self.get_order_legs(parent_order_id)
-
-            if legs['stop_loss_id']:
-                logger.info(f"Cancelling stop loss leg: {legs['stop_loss_id']}")
-                self.api.cancel_order(legs['stop_loss_id'])
-                logger.info(f"✅ Stop loss leg cancelled: {legs['stop_loss_id']}")
-                return True
-            else:
-                logger.warning(f"No stop loss leg found for order {parent_order_id}")
-                return False
-
-        except Exception as e:
-            logger.error(f"Error cancelling stop loss leg for {parent_order_id}: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return False
 
     def cancel_order(self, order_id: str) -> bool:
         """Cancel an existing order."""
@@ -866,336 +925,5 @@ class OrderManagerService:
             return False
 
 
-class BrokerOrderManagerService:
-    """
-    Broker API Order Manager - Supports bracket orders with stop loss + take profit.
-
-    Uses Alpaca Broker API instead of Trading API for advanced order types.
-    """
-
-    def __init__(self):
-        self.broker_api_url = settings.alpaca_broker_api_url
-        self.email = settings.alpaca_broker_email
-        self.password = settings.alpaca_broker_password
-        self.account_id = settings.alpaca_broker_account_id
-
-        # Create Basic Auth header
-        credentials = f"{self.email}:{self.password}"
-        encoded_credentials = base64.b64encode(credentials.encode()).decode()
-        self.auth_header = f"Basic {encoded_credentials}"
-
-        # Standard headers for all requests
-        self.headers = {
-            "accept": "application/json",
-            "content-type": "application/json",
-            "authorization": self.auth_header
-        }
-
-        # Market data API (still uses Trading API for quotes)
-        self.data_api = tradeapi.REST(
-            key_id=settings.alpaca_api_key,
-            secret_key=settings.alpaca_secret_key,
-            base_url=settings.alpaca_base_url
-        )
-
-        # Fetch account ID if not set
-        if not self.account_id:
-            self._fetch_account_id()
-
-        # Track pending orders
-        self.pending_orders = {}
-
-    def _fetch_account_id(self):
-        """Fetch the account ID from Broker API."""
-        try:
-            url = f"{self.broker_api_url}/v1/accounts"
-            response = requests.get(url, headers=self.headers)
-
-            if response.status_code == 200:
-                accounts = response.json()
-                if accounts and len(accounts) > 0:
-                    self.account_id = accounts[0]['id']
-                    logger.info(f"✅ Fetched Broker Account ID: {self.account_id}")
-                else:
-                    logger.error("No accounts found in Broker API")
-            else:
-                logger.error(f"Failed to fetch account ID: {response.status_code} - {response.text}")
-
-        except Exception as e:
-            logger.error(f"Error fetching account ID: {e}")
-
-    def get_account_info(self) -> Dict[str, Any]:
-        """Get account information from Broker API."""
-        try:
-            if not self.account_id:
-                logger.error("No account ID available")
-                return {}
-
-            url = f"{self.broker_api_url}/v1/trading/accounts/{self.account_id}/account"
-            response = requests.get(url, headers=self.headers)
-
-            if response.status_code == 200:
-                account = response.json()
-                return {
-                    "account_id": account.get('id'),
-                    "equity": float(account.get('equity', 0)),
-                    "cash": float(account.get('cash', 0)),
-                    "buying_power": float(account.get('buying_power', 0)),
-                    "portfolio_value": float(account.get('portfolio_value', 0))
-                }
-            else:
-                logger.error(f"Failed to get account info: {response.status_code} - {response.text}")
-                return {}
-
-        except Exception as e:
-            logger.error(f"Error getting account info: {e}")
-            return {}
-
-    def place_bracket_order(
-        self,
-        symbol: str,
-        side: str,
-        quantity: int,
-        stop_loss: float,
-        take_profit: float,
-        trade_id: str = None
-    ) -> Optional[str]:
-        """
-        Place a bracket order with entry, stop loss, and take profit.
-
-        This is the KEY method that uses Broker API to place all three orders at once!
-        """
-        try:
-            if not self.account_id:
-                logger.error("No account ID available for bracket order")
-                return None
-
-            if quantity <= 0:
-                logger.error(f"Invalid quantity for {symbol}: {quantity}")
-                return None
-
-            if side.lower() not in ['buy', 'sell']:
-                logger.error(f"Invalid side for {symbol}: {side}")
-                return None
-
-            # Round prices to 2 decimal places (cents) - Alpaca requirement
-            stop_loss = round(stop_loss, 2)
-            take_profit = round(take_profit, 2)
-
-            logger.info(f"🎯 Placing BRACKET ORDER: {side} {quantity} {symbol}")
-            logger.info(f"   Stop Loss: ${stop_loss:.2f}, Take Profit: ${take_profit:.2f}")
-
-            # Broker API endpoint
-            url = f"{self.broker_api_url}/v1/trading/accounts/{self.account_id}/orders"
-
-            # Build bracket order payload
-            payload = {
-                "symbol": symbol,
-                "qty": str(quantity),
-                "side": side.lower(),
-                "type": "market",
-                "time_in_force": "day",
-                "order_class": "bracket",
-                "stop_loss": {
-                    "stop_price": str(stop_loss)
-                },
-                "take_profit": {
-                    "limit_price": str(take_profit)
-                }
-            }
-
-            # Make the request
-            response = requests.post(url, json=payload, headers=self.headers)
-
-            if response.status_code in [200, 201]:
-                order_data = response.json()
-                order_id = order_data.get('id')
-
-                # Track the order
-                order_info = {
-                    "id": order_id,
-                    "symbol": symbol,
-                    "side": side.lower(),
-                    "quantity": quantity,
-                    "type": "bracket",
-                    "stop_loss": stop_loss,
-                    "take_profit": take_profit,
-                    "status": order_data.get('status'),
-                    "submitted_at": datetime.now().isoformat(),
-                    "trade_id": trade_id
-                }
-
-                self.pending_orders[order_id] = order_info
-                redis_cache.set(f"order:{order_id}", order_info, expiration=86400)
-
-                logger.info(f"✅ BRACKET ORDER PLACED: {order_id}")
-                logger.info(f"   Entry Order ID: {order_id}")
-                logger.info(f"   Stop Loss: ${stop_loss:.2f}, Take Profit: ${take_profit:.2f}")
-
-                return order_id
-            else:
-                logger.error(f"❌ Bracket order failed: {response.status_code}")
-                logger.error(f"   Response: {response.text}")
-                return None
-
-        except Exception as e:
-            logger.error(f"Error placing bracket order for {symbol}: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return None
-
-    def place_market_order(self, symbol: str, side: str, quantity: int, trade_id: str = None) -> Optional[str]:
-        """Place a simple market order (without stop/take profit)."""
-        try:
-            if not self.account_id:
-                logger.error("No account ID available")
-                return None
-
-            url = f"{self.broker_api_url}/v1/trading/accounts/{self.account_id}/orders"
-
-            payload = {
-                "symbol": symbol,
-                "qty": str(quantity),
-                "side": side.lower(),
-                "type": "market",
-                "time_in_force": "day"
-            }
-
-            response = requests.post(url, json=payload, headers=self.headers)
-
-            if response.status_code in [200, 201]:
-                order_data = response.json()
-                order_id = order_data.get('id')
-                logger.info(f"✅ Market order placed: {order_id}")
-                return order_id
-            else:
-                logger.error(f"Market order failed: {response.status_code} - {response.text}")
-                return None
-
-        except Exception as e:
-            logger.error(f"Error placing market order: {e}")
-            return None
-
-    def get_open_positions(self) -> List[Dict[str, Any]]:
-        """Get all open positions from Broker API."""
-        try:
-            if not self.account_id:
-                logger.error("No account ID available")
-                return []
-
-            url = f"{self.broker_api_url}/v1/trading/accounts/{self.account_id}/positions"
-            response = requests.get(url, headers=self.headers)
-
-            if response.status_code == 200:
-                positions = response.json()
-                logger.info(f"Retrieved {len(positions)} open positions from Broker API")
-                return positions
-            else:
-                logger.error(f"Failed to get positions: {response.status_code} - {response.text}")
-                return []
-
-        except Exception as e:
-            logger.error(f"Error getting positions: {e}")
-            return []
-
-    def get_position(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """Get a specific position by symbol."""
-        try:
-            if not self.account_id:
-                logger.error("No account ID available")
-                return None
-
-            url = f"{self.broker_api_url}/v1/trading/accounts/{self.account_id}/positions/{symbol}"
-            response = requests.get(url, headers=self.headers)
-
-            if response.status_code == 200:
-                position = response.json()
-                return position
-            elif response.status_code == 404:
-                logger.info(f"No position found for {symbol}")
-                return None
-            else:
-                logger.error(f"Failed to get position for {symbol}: {response.status_code} - {response.text}")
-                return None
-
-        except Exception as e:
-            logger.error(f"Error getting position for {symbol}: {e}")
-            return None
-
-    def close_position(self, symbol: str) -> bool:
-        """
-        Close a position using Broker API.
-
-        This uses the Broker API DELETE endpoint to close a position.
-        URL: DELETE /v1/trading/accounts/{account_id}/positions/{symbol}
-        """
-        try:
-            if not self.account_id:
-                logger.error("No account ID available")
-                return False
-
-            # First check if position exists
-            position = self.get_position(symbol)
-            if not position:
-                logger.warning(f"No position found for {symbol}")
-                return False
-
-            logger.info(f"🔒 Closing position for {symbol}")
-            logger.info(f"   Current Qty: {position.get('qty')}")
-            logger.info(f"   Current Value: ${float(position.get('market_value', 0)):.2f}")
-
-            # Close the position using Broker API DELETE endpoint
-            url = f"{self.broker_api_url}/v1/trading/accounts/{self.account_id}/positions/{symbol}"
-            response = requests.delete(url, headers=self.headers)
-
-            if response.status_code in [200, 204]:
-                logger.info(f"✅ Position closed successfully for {symbol}")
-                return True
-            else:
-                logger.error(f"❌ Failed to close position for {symbol}: {response.status_code}")
-                logger.error(f"   Response: {response.text}")
-                return False
-
-        except Exception as e:
-            logger.error(f"Error closing position for {symbol}: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return False
-
-    def close_all_positions(self) -> bool:
-        """Close all open positions."""
-        try:
-            if not self.account_id:
-                logger.error("No account ID available")
-                return False
-
-            logger.info("🔒 Closing all positions...")
-
-            # Close all positions using Broker API
-            url = f"{self.broker_api_url}/v1/trading/accounts/{self.account_id}/positions"
-            response = requests.delete(url, headers=self.headers)
-
-            if response.status_code in [200, 204, 207]:  # 207 = Multi-Status (partial success)
-                logger.info("✅ All positions closed")
-                return True
-            else:
-                logger.error(f"Failed to close all positions: {response.status_code} - {response.text}")
-                return False
-
-        except Exception as e:
-            logger.error(f"Error closing all positions: {e}")
-            return False
-
-    def health_check(self) -> bool:
-        """Check if Broker API is accessible."""
-        try:
-            account_info = self.get_account_info()
-            return bool(account_info and account_info.get('account_id'))
-        except Exception as e:
-            logger.error(f"Broker API health check failed: {e}")
-            return False
-
-
 # Create global order manager service instance
-# Using Trading API with OCO/Bracket orders for stop loss + take profit
 order_manager = OrderManagerService()

@@ -29,7 +29,8 @@ class Settings(BaseSettings):
     alpaca_base_url: str = Field(default="https://paper-api.alpaca.markets", env="ALPACA_BASE_URL")
     alpaca_data_url: str = Field(default="https://data.alpaca.markets", env="ALPACA_DATA_URL")
 
-    # Alpaca Broker API (for bracket orders with stop loss + take profit)
+    # Alpaca Broker API (Legacy - not currently used)
+    # Note: Using Trading API for all order management now
     alpaca_broker_api_url: str = Field(default="https://broker-api.sandbox.alpaca.markets", env="ALPACA_BROKER_API_URL")
     alpaca_broker_email: str = Field(default="", env="ALPACA_BROKER_EMAIL")
     alpaca_broker_password: str = Field(default="", env="ALPACA_BROKER_PASSWORD")

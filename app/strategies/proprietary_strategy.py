@@ -1,44 +1,54 @@
 """
-Proprietary Trading Strategy - Gap + Volume + MACD + RSI
-========================================================
+Proprietary Trading Strategy - Gap Screening + MACD + Volume + RSI
+===================================================================
 
-Research-backed strategy combining the most effective indicators for gap trading:
-1. Gap Analysis (0.75% - 20%)
-2. Volume Confirmation (>2x average - CRITICAL for gap validation)
-3. MACD with Divergence Detection (momentum + reversal signals)
+Research-backed strategy combining the most effective indicators:
+1. Gap Analysis (0.75% - 20%) - FOR SCREENING VOLATILE STOCKS ONLY
+2. Volume Confirmation (>1.5x average - CRITICAL for quality setups)
+3. MACD Histogram (momentum direction - DETERMINES LONG/SHORT)
 4. RSI for overbought/oversold confirmation
+
+KEY PRINCIPLE: Gap is for SCREENING, not direction! MACD determines trade direction.
 
 Based on research showing 73-74% win rate for this combination.
 
 Entry Rules:
 -----------
-LONG:
-- Gap up detected (0.75% - 20%)
-- Volume > 2x average (cumulative: today's total volume vs 30-day average daily volume)
+LONG (MACD Histogram > threshold):
+- Gap detected (ANY direction - confirms volatility)
+- Volume > 1.5x average (cumulative: today's total volume vs 30-day average daily volume)
 - RSI < 70 (not overbought)
-- MACD bullish crossover OR bullish divergence (20-bar lookback)
-- Time: Before 12 PM EST
+- MACD histogram > threshold (bullish momentum - TIME-AWARE: 0.012 before 10:30 AM, 0.02 after)
+- Time: Before 2 PM EST
 
-SHORT:
-- Gap down detected (0.75% - 20%)
-- Volume > 2x average (cumulative: today's total volume vs 30-day average daily volume)
+SHORT (MACD Histogram < -threshold):
+- Gap detected (ANY direction - confirms volatility)
+- Volume > 1.5x average (cumulative: today's total volume vs 30-day average daily volume)
 - RSI > 30 (not oversold)
-- MACD bearish crossover OR bearish divergence (20-bar lookback)
-- Time: Before 12 PM EST
+- MACD histogram < -threshold (bearish momentum - TIME-AWARE: -0.012 before 10:30 AM, -0.02 after)
+- Time: Before 2 PM EST
 
 Exit Rules:
 ----------
-- Stop Loss: Entry ± (2 × ATR)
-- Target: ATR-based (1.5x ATR for partial, 3x ATR for full)
-- Let bracket orders run to target (no early exits)
+- ALPACA AUTOMATIC TRAILING STOP: Active immediately after entry via OTO orders
+  - Trail Type: trail_price (dollar amount - ATR distance)
+  - Trail Distance: Same as initial stop distance (typically $2-5)
+  - High Water Mark (HWM): Alpaca tracks highest price since entry
+  - Stop Formula: stop_price = hwm - trail_price
+  - Behavior: Stop follows price up continuously, never moves down
+  - Example: Entry $100, trail $3 → Price $110 → Stop $107 (auto-adjusted)
+  - Zero manual intervention - Alpaca handles everything
+- Target: ATR-based (2.5x initial risk)
+- Let orders run to target or trailing stop (fully automated)
 
 Risk Management:
 ---------------
-- Max daily potential loss: $600
+- Max daily potential loss: $540 (reduced for tighter risk control)
 - Dynamic adjustment based on realized P/L
-- If win $100 → can risk $500 more
-- If lose $100 → can risk $500 more
-- No trading after 11 AM EST
+- If win $100 → can risk $440 more
+- If lose $100 → can risk $440 more
+- No trading after 2 PM EST
+- Position close time: 3:50 PM EST
 """
 
 import asyncio
@@ -116,7 +126,7 @@ class ProprietaryStrategy:
         # Strategy parameters
         self.min_gap_percent = 0.75
         self.max_gap_percent = 20.0
-        self.min_volume_ratio = 2.0  # CRITICAL: Volume must be 2x average
+        self.min_volume_ratio = 1.5  # Volume must be 1.5x average - RESTORED to original strict requirement
         self.atr_stop_multiplier = 1.5  # 1.5x ATR for breathing room (was 0.9 - too tight!)
         self.min_stop_distance_dollars = 0.30  # Minimum $0.30 stop distance
         self.min_stop_distance_percent = 1.2  # OR 1.2% of price, whichever is larger
@@ -132,7 +142,7 @@ class ProprietaryStrategy:
         self.divergence_lookback = 20  # Look back 20 bars for divergence
 
         # Risk Management
-        self.max_daily_loss = 600.0  # Max $600 potential loss per day
+        self.max_daily_loss = 540.0  # Max $540 potential loss per day (reduced by 10% from $600)
         self.daily_realized_pnl = 0.0  # Track today's realized P/L
 
         # Time restriction - Extended to capture afternoon moves
@@ -140,20 +150,14 @@ class ProprietaryStrategy:
         self.position_close_hour = 15  # Close all positions by 3:50 PM EST
         self.position_close_minute = 50  # Close at exactly 3:50 PM
 
-        # DOLLAR-BASED TRAILING STOP SYSTEM
-        self.enable_trailing_stops = True  # Enable trailing stop upgrades
-        self.use_dollar_based_stops = True  # Use dollar amounts instead of percentages
-
-        # Dollar-based profit lock tiers (activate immediately from entry)
-        self.breakeven_profit_threshold = 15.0   # At +$15: Move stop to breakeven (lowered from $30)
-        self.quick_profit_threshold = 20.0       # At +$20 within 10 min: Immediate breakeven
-        self.quick_profit_time_window = 600      # 10 minutes (600 seconds)
-        self.tier1_profit_threshold = 50.0       # At +$50: Lock in $50 profit
-        self.tier2_profit_threshold = 100.0      # At +$100: Lock in $100 profit
-        self.profit_increment = 50.0             # Every additional $50: Move stop up
+        # ALPACA NATIVE TRAILING STOPS
+        # Uses OTO orders with trail_price (dollar amount trailing)
+        # Alpaca automatically adjusts stop as price moves favorably
+        # Stop distance = ATR-based (same as initial stop loss distance)
+        self.enable_trailing_stops = True       # Use Alpaca's automatic trailing stops
 
         # Whipsaw prevention
-        self.stop_out_cooldown = 1200            # 20 minutes cooldown after stop out (seconds)
+        self.stop_out_cooldown = 3600            # 60 minutes (1 hour) cooldown after stop out to prevent whipsaws (seconds)
         self.recent_stop_outs: Dict[str, float] = {}  # Track stop out timestamps by symbol
 
         # Profit target multipliers (adjusted for tighter stops)
@@ -194,16 +198,14 @@ class ProprietaryStrategy:
             logger.info(f"   New trades cutoff: {self.trading_cutoff_hour}:00 PM EST")
             logger.info(f"   Position close time: {self.position_close_hour}:{self.position_close_minute:02d} PM EST")
 
-            # Log dollar-based trailing stop configuration
-            if self.enable_trailing_stops and self.use_dollar_based_stops:
-                logger.info(f"💰 DOLLAR-BASED STOP MANAGEMENT: ENABLED")
-                logger.info(f"   ${self.breakeven_profit_threshold:.0f} profit → Move to BREAKEVEN")
-                logger.info(f"   ${self.tier1_profit_threshold:.0f} profit → Lock in ${self.tier1_profit_threshold:.0f}")
-                logger.info(f"   ${self.tier2_profit_threshold:.0f} profit → Lock in ${self.tier2_profit_threshold:.0f}")
-                logger.info(f"   Every +${self.profit_increment:.0f} → Continue moving stop up")
-                logger.info(f"   Initial stop: {self.atr_stop_multiplier}x ATR (10% tighter)")
-            else:
-                logger.info(f"📍 Trailing stops: DISABLED (using fixed stops only)")
+            # Log Alpaca trailing stop configuration
+            logger.info(f"🔄 ALPACA AUTOMATIC TRAILING STOPS: ENABLED")
+            logger.info(f"   Method: OTO (One-Triggers-Other) orders with trail_price")
+            logger.info(f"   Trail Distance: ATR-based dollar amount (~$2-5 typical)")
+            logger.info(f"   Behavior: Stop follows price continuously, never moves back")
+            logger.info(f"   Activation: Immediately after entry fills (no delay)")
+            logger.info(f"   Alpaca auto-adjusts stop every tick as HWM increases")
+            logger.info(f"   💰 Max daily risk: ${self.max_daily_loss:.0f}")
 
             return True
 
@@ -215,7 +217,9 @@ class ProprietaryStrategy:
         """Get today's realized P/L from closed trades."""
         try:
             with get_db_session() as db:
-                today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+                # Use EST timezone for trading day calculation
+                est = pytz.timezone('US/Eastern')
+                today_start = datetime.now(est).replace(hour=0, minute=0, second=0, microsecond=0)
 
                 trades = db.query(Trade).filter(
                     Trade.exit_time >= today_start,
@@ -445,7 +449,7 @@ class ProprietaryStrategy:
 
                 # Get market data
                 df_daily = market_data_service.get_bars(symbol, timeframe='1Day', limit=100)
-                df_5min = market_data_service.get_bars(symbol, timeframe='5Min', limit=100)
+                df_5min = market_data_service.get_bars(symbol, timeframe='5Min', limit=300)  # Increased for better MACD calculation
 
                 if df_daily is None or df_5min is None or len(df_daily) < 30 or len(df_5min) < 50:
                     continue
@@ -647,6 +651,23 @@ class ProprietaryStrategy:
             macd_bullish_cross = (prev_macd <= prev_signal) and (current_macd > current_signal)
             macd_bearish_cross = (prev_macd >= prev_signal) and (current_macd < current_signal)
 
+            # MACD histogram threshold for valid signals (research-based)
+            # Histogram between -0.20 and +0.20 is considered aggressive entry zone
+            # RESTORED: 0.02 - strict threshold to filter out weak momentum and reduce false signals
+            # TIME-AWARE: Relaxed threshold during market open (first 60 min) when MACD is still building
+            est = pytz.timezone('US/Eastern')
+            current_time_est = datetime.now(est).time()
+            market_open_time = time(9, 30)
+            early_trading_cutoff = time(10, 30)  # First hour after open
+
+            # Relax threshold during first hour of trading (9:30-10:30 AM EST)
+            if market_open_time <= current_time_est < early_trading_cutoff:
+                macd_histogram_threshold = 0.012  # More lenient during market open
+                logger.info(f"   ⏰ Early trading period - using relaxed MACD threshold: {macd_histogram_threshold}")
+            else:
+                macd_histogram_threshold = 0.02  # Strict threshold after 10:30 AM
+                logger.debug(f"   MACD threshold: {macd_histogram_threshold} (normal hours)")
+
             # MACD divergence detection
             has_divergence, divergence_type = self._detect_macd_divergence(df_with_macd, self.divergence_lookback)
 
@@ -673,12 +694,18 @@ class ProprietaryStrategy:
             setup_reasons = []
             signal_strength = 0
 
-            # LONG SETUP ANALYSIS
-            if gap_data['gap_direction'] == 'up':
+            # DETERMINE TRADE DIRECTION FROM MACD (NOT GAP!)
+            # Gap is for screening only - MACD histogram determines bullish/bearish momentum
+            # Positive histogram = bullish momentum → LONG
+            # Negative histogram = bearish momentum → SHORT
+
+            # LONG SETUP ANALYSIS - MACD showing bullish momentum
+            if current_histogram > macd_histogram_threshold:
                 is_long_valid = True
 
-                # 1. Gap up detected
-                setup_reasons.append(f"Gap up: {gap_data['gap_percent']:.2f}%")
+                # 1. Gap detected (any direction - just confirms volatility)
+                gap_pct = abs(gap_data['gap_percent'])
+                setup_reasons.append(f"Gap: {gap_data['gap_percent']:.2f}%")
                 signal_strength += 2
 
                 # 2. Volume confirmation (CRITICAL!)
@@ -699,7 +726,7 @@ class ProprietaryStrategy:
                     is_long_valid = False
                     logger.info(f"❌ {symbol} LONG: RSI overbought at {current_rsi:.1f}")
 
-                # 4. MACD confirmation (crossover OR divergence)
+                # 4. MACD confirmation - bullish histogram with minimum threshold
                 macd_confirmed = False
                 if macd_bullish_cross:
                     setup_reasons.append("MACD bullish crossover")
@@ -711,11 +738,11 @@ class ProprietaryStrategy:
                     signal_strength += 3
                     macd_confirmed = True
                     logger.info(f"✅ {symbol} LONG: MACD bullish divergence detected")
-                elif current_macd > current_signal:
-                    setup_reasons.append("MACD above signal")
-                    signal_strength += 1
+                elif current_histogram > macd_histogram_threshold:
+                    setup_reasons.append(f"MACD bullish (hist={current_histogram:.3f})")
+                    signal_strength += 3  # INCREASED from +1 to +3
                     macd_confirmed = True
-                    logger.info(f"✅ {symbol} LONG: MACD above signal line")
+                    logger.info(f"✅ {symbol} LONG: MACD histogram bullish ({current_histogram:.3f})")
 
                 if not macd_confirmed:
                     is_long_valid = False
@@ -729,12 +756,13 @@ class ProprietaryStrategy:
                 else:
                     logger.info(f"⚠️ {symbol} LONG: Signal strength insufficient ({signal_strength} < 7)")
 
-            # SHORT SETUP ANALYSIS
-            elif gap_data['gap_direction'] == 'down':
+            # SHORT SETUP ANALYSIS - MACD showing bearish momentum
+            elif current_histogram < -macd_histogram_threshold:
                 is_short_valid = True
 
-                # 1. Gap down detected
-                setup_reasons.append(f"Gap down: {gap_data['gap_percent']:.2f}%")
+                # 1. Gap detected (any direction - just confirms volatility)
+                gap_pct = abs(gap_data['gap_percent'])
+                setup_reasons.append(f"Gap: {gap_data['gap_percent']:.2f}%")
                 signal_strength += 2
 
                 # 2. Volume confirmation (CRITICAL!)
@@ -755,7 +783,7 @@ class ProprietaryStrategy:
                     is_short_valid = False
                     logger.info(f"❌ {symbol} SHORT: RSI oversold at {current_rsi:.1f}")
 
-                # 4. MACD confirmation (crossover OR divergence)
+                # 4. MACD confirmation - bearish histogram with minimum threshold
                 macd_confirmed = False
                 if macd_bearish_cross:
                     setup_reasons.append("MACD bearish crossover")
@@ -767,25 +795,77 @@ class ProprietaryStrategy:
                     signal_strength += 3
                     macd_confirmed = True
                     logger.info(f"✅ {symbol} SHORT: MACD bearish divergence detected")
-                elif current_macd < current_signal:
-                    setup_reasons.append("MACD below signal")
-                    signal_strength += 1
+                elif current_histogram < -macd_histogram_threshold:
+                    setup_reasons.append(f"MACD bearish (hist={current_histogram:.3f})")
+                    signal_strength += 3  # INCREASED from +1 to +3
                     macd_confirmed = True
-                    logger.info(f"✅ {symbol} SHORT: MACD below signal line")
+                    logger.info(f"✅ {symbol} SHORT: MACD histogram bearish ({current_histogram:.3f})")
 
                 if not macd_confirmed:
                     is_short_valid = False
                     logger.info(f"❌ {symbol} SHORT: No MACD confirmation")
 
                 # Signal strength threshold: 7+ for strong signal
+                # 2 (gap) + 3 (volume) + 2 (RSI) + 3 (MACD) = 10 max
                 if is_short_valid and signal_strength >= 7:
                     signal_type = SignalType.SHORT
                     logger.info(f"🎯 {symbol} SHORT SIGNAL GENERATED! Strength: {signal_strength}/10")
                 else:
                     logger.info(f"⚠️ {symbol} SHORT: Signal strength insufficient ({signal_strength} < 7)")
 
-            # If no valid signal, return None
+            # If no valid signal, return None with detailed rejection reasons
             if signal_type == SignalType.NONE:
+                # Build detailed rejection reasons
+                rejection_reasons = []
+
+                # Determine what signal type was attempted based on MACD
+                attempted_signal = "UNKNOWN"
+                if current_histogram > macd_histogram_threshold:
+                    attempted_signal = "LONG"
+                elif current_histogram < -macd_histogram_threshold:
+                    attempted_signal = "SHORT"
+                else:
+                    # MACD didn't meet threshold - this is the primary rejection
+                    if abs(current_histogram) > 0:
+                        if current_histogram > 0:
+                            attempted_signal = "LONG"
+                            rejection_reasons.append(f"MACD hist too weak ({current_histogram:.3f} < {macd_histogram_threshold})")
+                        else:
+                            attempted_signal = "SHORT"
+                            rejection_reasons.append(f"MACD hist too weak ({current_histogram:.3f} > -{macd_histogram_threshold})")
+                    else:
+                        rejection_reasons.append(f"MACD hist neutral ({current_histogram:.3f})")
+
+                # Check volume
+                if volume_ratio < self.min_volume_ratio:
+                    rejection_reasons.append(f"Vol too low ({volume_ratio:.1f}x < {self.min_volume_ratio}x)")
+
+                # Check RSI based on signal type
+                if attempted_signal == "LONG":
+                    if current_rsi >= self.rsi_overbought:
+                        rejection_reasons.append(f"RSI overbought ({current_rsi:.1f} >= {self.rsi_overbought})")
+                elif attempted_signal == "SHORT":
+                    if current_rsi <= self.rsi_oversold:
+                        rejection_reasons.append(f"RSI oversold ({current_rsi:.1f} <= {self.rsi_oversold})")
+
+                # Check signal strength
+                if signal_strength < 7:
+                    rejection_reasons.append(f"Signal strength insufficient ({signal_strength}/10 < 7)")
+
+                # Build rejection message
+                if not rejection_reasons:
+                    rejection_reasons.append("No clear signal direction")
+
+                rejection_msg = f"REJECTED [{attempted_signal}] - " + " | ".join(rejection_reasons)
+                rejection_msg += f" | Gap={gap_data['gap_percent']:.1f}%, Vol={volume_ratio:.1f}x, RSI={current_rsi:.1f}, MACD={current_histogram:.3f}"
+
+                logger.warning(f"❌ {symbol}: {rejection_msg}")
+                analysis_logger._add_log(
+                    'warning',
+                    rejection_msg,
+                    symbol,
+                    analysis_logger._get_trading_time()
+                )
                 return None
 
             # Calculate entry levels
@@ -823,11 +903,15 @@ class ProprietaryStrategy:
             # Validate levels
             if signal_type == SignalType.LONG:
                 if target_price <= entry_price or stop_loss >= entry_price:
-                    logger.warning(f"⚠️ {symbol} LONG: Invalid levels")
+                    rejection_msg = f"REJECTED [LONG] - Invalid levels: Entry=${entry_price:.2f}, Stop=${stop_loss:.2f}, Target=${target_price:.2f}"
+                    logger.warning(f"⚠️ {symbol}: {rejection_msg}")
+                    analysis_logger._add_log('warning', rejection_msg, symbol, analysis_logger._get_trading_time())
                     return None
             else:
                 if target_price >= entry_price or stop_loss <= entry_price:
-                    logger.warning(f"⚠️ {symbol} SHORT: Invalid levels")
+                    rejection_msg = f"REJECTED [SHORT] - Invalid levels: Entry=${entry_price:.2f}, Stop=${stop_loss:.2f}, Target=${target_price:.2f}"
+                    logger.warning(f"⚠️ {symbol}: {rejection_msg}")
+                    analysis_logger._add_log('warning', rejection_msg, symbol, analysis_logger._get_trading_time())
                     return None
 
             # Calculate position size
@@ -841,6 +925,10 @@ class ProprietaryStrategy:
             )[0]
 
             if shares <= 0:
+                signal_dir = "LONG" if signal_type == SignalType.LONG else "SHORT"
+                rejection_msg = f"REJECTED [{signal_dir}] - Position size too small (shares={shares}): Entry=${entry_price:.2f}, Risk=${risk_per_share:.2f}/share"
+                logger.warning(f"❌ {symbol}: {rejection_msg}")
+                analysis_logger._add_log('warning', rejection_msg, symbol, analysis_logger._get_trading_time())
                 return None
 
             # Calculate actual potential loss with real position size
@@ -848,12 +936,16 @@ class ProprietaryStrategy:
 
             # Check daily loss limit
             if not self._check_daily_loss_limit(potential_loss):
-                logger.warning(f"❌ {symbol}: Trade rejected due to daily loss limit")
+                signal_dir = "LONG" if signal_type == SignalType.LONG else "SHORT"
+                rejection_msg = f"REJECTED [{signal_dir}] - Daily loss limit: Potential loss ${potential_loss:.2f} would exceed limit"
+                logger.warning(f"❌ {symbol}: {rejection_msg}")
+                analysis_logger._add_log('warning', rejection_msg, symbol, analysis_logger._get_trading_time())
                 return None
 
             logger.info(f"✅ {symbol}: Entry=${entry_price:.2f}, Stop=${stop_loss:.2f}, Target=${target_price:.2f}, Size={shares}")
 
             # Create trade setup
+            est = pytz.timezone('US/Eastern')
             setup = TradeSetup(
                 symbol=symbol,
                 signal_type=signal_type,
@@ -873,7 +965,7 @@ class ProprietaryStrategy:
                 signal_strength=signal_strength,
                 setup_reasons=setup_reasons,
                 confidence_score=min(signal_strength * 10, 95),
-                timestamp=datetime.now()
+                timestamp=datetime.now(est)
             )
 
             return setup
@@ -893,6 +985,12 @@ class ProprietaryStrategy:
         if not self._check_time_restriction():
             return []
 
+        # Log how many setups we're monitoring
+        if len(self.active_setups) > 0:
+            logger.info(f"📋 Monitoring {len(self.active_setups)} active setups: {list(self.active_setups.keys())}")
+        else:
+            logger.debug("📋 No active setups to monitor")
+
         entry_signals = []
 
         for symbol, setup in list(self.active_setups.items()):
@@ -901,11 +999,13 @@ class ProprietaryStrategy:
                 df = market_data_service.get_bars(symbol, timeframe='1Min', limit=10)
 
                 if df is None or len(df) < 2:
+                    logger.debug(f"⚠️ {symbol}: Insufficient market data for entry signal")
                     continue
 
                 current_price = df['close'].iloc[-1]
 
                 # For this simplified strategy, enter immediately if setup is valid
+                logger.info(f"🎯 {symbol}: Generating entry signal at ${current_price:.2f}")
                 entry_signals.append({
                     'action': 'enter_trade',
                     'setup': setup,
@@ -926,16 +1026,46 @@ class ProprietaryStrategy:
 
             # Final time check
             if not self._check_time_restriction():
-                logger.warning(f"❌ {setup.symbol}: Trading cutoff reached")
+                signal_dir = "LONG" if setup.signal_type == SignalType.LONG else "SHORT"
+                rejection_msg = f"REJECTED [{signal_dir}] - Trading cutoff time reached"
+                logger.warning(f"❌ {setup.symbol}: {rejection_msg}")
+                analysis_logger._add_log('warning', rejection_msg, setup.symbol, analysis_logger._get_trading_time())
                 self.active_setups.pop(setup.symbol, None)
                 return None
 
             # Check if we already have a position
             existing_position = portfolio_service.get_position_by_symbol(setup.symbol)
             if existing_position:
-                logger.warning(f"Already have position for {setup.symbol}. Skipping.")
+                signal_dir = "LONG" if setup.signal_type == SignalType.LONG else "SHORT"
+                rejection_msg = f"REJECTED [{signal_dir}] - Already have position in this symbol"
+                logger.warning(f"❌ {setup.symbol}: {rejection_msg}")
+                analysis_logger._add_log('warning', rejection_msg, setup.symbol, analysis_logger._get_trading_time())
                 self.active_setups.pop(setup.symbol, None)
                 return None
+
+            # Check if we already traded this symbol today (prevent re-entry on same day)
+            try:
+                with get_db_session() as db:
+                    # Use EST timezone for trading day calculation
+                    est = pytz.timezone('US/Eastern')
+                    today_start = datetime.now(est).replace(hour=0, minute=0, second=0, microsecond=0)
+
+                    existing_trade_today = db.query(Trade).filter(
+                        Trade.symbol == setup.symbol,
+                        Trade.entry_time >= today_start
+                    ).first()
+
+                    if existing_trade_today:
+                        signal_dir = "LONG" if setup.signal_type == SignalType.LONG else "SHORT"
+                        rejection_msg = f"REJECTED [{signal_dir}] - Already traded this symbol today (prevent re-entry)"
+                        logger.warning(f"❌ {setup.symbol}: {rejection_msg}")
+                        logger.info(f"   Previous trade today: Entry @ {existing_trade_today.entry_time.strftime('%H:%M:%S')}")
+                        analysis_logger._add_log('warning', rejection_msg, setup.symbol, analysis_logger._get_trading_time())
+                        self.active_setups.pop(setup.symbol, None)
+                        return None
+            except Exception as e:
+                logger.error(f"Error checking for existing trades today for {setup.symbol}: {e}")
+                # Continue with trade if check fails (don't block on error)
 
             # Validate trade setup
             validation = risk_manager.validate_trade_setup(
@@ -946,28 +1076,34 @@ class ProprietaryStrategy:
             )
 
             if not validation.get('is_valid', False):
-                logger.warning(f"Trade validation failed for {setup.symbol}: {validation.get('errors', [])}")
+                signal_dir = "LONG" if setup.signal_type == SignalType.LONG else "SHORT"
+                errors = ", ".join(validation.get('errors', ['Unknown validation error']))
+                rejection_msg = f"REJECTED [{signal_dir}] - Validation failed: {errors}"
+                logger.warning(f"❌ {setup.symbol}: {rejection_msg}")
+                analysis_logger._add_log('warning', rejection_msg, setup.symbol, analysis_logger._get_trading_time())
                 self.active_setups.pop(setup.symbol, None)
                 return None
 
             # Check if stock is shortable (only for SHORT signals)
             if setup.signal_type == SignalType.SHORT:
                 if not self._is_stock_shortable(setup.symbol):
-                    logger.warning(f"❌ {setup.symbol}: Stock is not shortable - skipping SHORT trade")
+                    rejection_msg = f"REJECTED [SHORT] - Stock is not shortable"
+                    logger.warning(f"❌ {setup.symbol}: {rejection_msg}")
+                    analysis_logger._add_log('warning', rejection_msg, setup.symbol, analysis_logger._get_trading_time())
                     self.active_setups.pop(setup.symbol, None)
                     return None
                 logger.info(f"✅ {setup.symbol}: Confirmed shortable - proceeding with SHORT trade")
 
-            # Place BRACKET ORDER with LIMIT entry
+            # Place ENTRY ORDER with TRAILING STOP + TAKE PROFIT
             side = 'buy' if setup.signal_type == SignalType.LONG else 'sell'
 
-            logger.info(f"🎯 EXECUTING BRACKET ORDER (LIMIT) for {setup.symbol}:")
+            logger.info(f"🎯 EXECUTING TRADE for {setup.symbol}:")
             logger.info(f"   Side: {side}, Qty: {setup.position_size}")
             logger.info(f"   Entry Limit: ${setup.entry_price:.2f}")
-            logger.info(f"   Stop Loss: ${setup.stop_loss:.2f}")
+            logger.info(f"   Trailing Stop: 1.5x ATR (placed after fill)")
             logger.info(f"   Take Profit: ${setup.target_price:.2f}")
 
-            # Place bracket order with limit entry
+            # Place entry order (trailing stop + take profit placed automatically after fill)
             order_id = order_manager.place_bracket_order(
                 symbol=setup.symbol,
                 side=side,
@@ -981,8 +1117,9 @@ class ProprietaryStrategy:
                 # Remove from active setups
                 self.active_setups.pop(setup.symbol, None)
 
-                logger.info(f"✅ BRACKET ORDER PLACED: {setup.symbol} {side} {setup.position_size} shares")
-                logger.info(f"   Order ID: {order_id}")
+                logger.info(f"✅ TRADE PLACED: {setup.symbol} {side} {setup.position_size} shares")
+                logger.info(f"   Entry Order ID: {order_id}")
+                logger.info(f"   Trailing stop + take profit will be placed after entry fills")
 
                 # Create database records
                 trade_id = order_id
@@ -998,13 +1135,17 @@ class ProprietaryStrategy:
                     logger.warning(f"Could not create database records: {e}")
 
                 # Add to active positions
+                est = pytz.timezone('US/Eastern')
                 self.active_positions[setup.symbol] = {
                     'setup': setup,
                     'trade_id': trade_id,
                     'order_id': order_id,
-                    'entry_time': datetime.now()
+                    'entry_time': datetime.now(est),
+                    'has_trailing_stop': True,  # Trailing stop placed automatically after entry fills
+                    'tier': '🔄 Native Trailing Stop'
                 }
 
+                logger.info(f"✅ {setup.symbol}: Added to active position tracking")
                 return trade_id
 
             else:
@@ -1021,6 +1162,9 @@ class ProprietaryStrategy:
         """Create trade record in database."""
         try:
             with get_db_session() as db:
+                # Use EST timezone for consistency with re-entry filter
+                est = pytz.timezone('US/Eastern')
+
                 trade = Trade(
                     symbol=setup.symbol,
                     side='long' if setup.signal_type == SignalType.LONG else 'short',
@@ -1029,20 +1173,23 @@ class ProprietaryStrategy:
                     stop_loss=Decimal(str(setup.stop_loss)),
                     target_price=Decimal(str(setup.target_price)),
                     strategy='proprietary_gap_macd_rsi',
-                    setup_type=setup.signal_type.value,
+                    setup_type=setup.setup_type,  # Use the string directly
                     alpaca_order_id=order_id,
-                    entry_time=datetime.now(),
-                    status=TradeStatus.FILLED
+                    entry_time=datetime.now(est),
+                    status='pending'  # Use string value, will update to 'filled' when order fills
                 )
 
                 db.add(trade)
                 db.commit()
                 db.refresh(trade)
 
+                logger.info(f"✅ Trade record created in database: {trade.id}")
                 return str(trade.id)
 
         except Exception as e:
-            logger.error(f"Error creating trade record: {e}")
+            logger.error(f"❌ Error creating trade record for {setup.symbol}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return ""
 
     async def _create_position_record(self, setup: TradeSetup, trade_id: str) -> str:
@@ -1060,7 +1207,7 @@ class ProprietaryStrategy:
                     target_price=Decimal(str(setup.target_price)),
                     status=PositionStatus.OPEN,
                     strategy='proprietary_gap_macd_rsi',
-                    setup_type=setup.signal_type.value,
+                    setup_type=setup.setup_type,  # Use string directly
                     trade_id=trade_id
                 )
 
@@ -1070,151 +1217,14 @@ class ProprietaryStrategy:
                 db.commit()
                 db.refresh(position)
 
+                logger.info(f"✅ Position record created in database: {position.id}")
                 return str(position.id)
 
         except Exception as e:
-            logger.error(f"Error creating position record: {e}")
-            return ""
-
-    async def upgrade_to_trailing_stop(self, symbol: str, position_data: Dict) -> bool:
-        """
-        Upgrade position stop based on DOLLAR PROFIT MILESTONES.
-
-        DOLLAR-BASED PROFIT PROTECTION TIERS:
-        - $30 profit: Move stop to breakeven (protect entry)
-        - $50 profit: Lock in $50 profit minimum
-        - $100 profit: Lock in $100 profit minimum
-        - Every +$50: Continue moving stop up to lock in gains
-
-        Args:
-            symbol: Stock symbol
-            position_data: Position information including setup and order IDs
-
-        Returns:
-            True if successfully upgraded, False otherwise
-        """
-        try:
-            setup: TradeSetup = position_data['setup']
-            entry_price = setup.entry_price
-
-            # Get current price
-            current_price = market_data_service.get_current_price(symbol)
-            if not current_price:
-                logger.warning(f"Could not get current price for {symbol}")
-                return False
-
-            # Calculate dollar profit
-            if setup.signal_type == SignalType.LONG:
-                dollar_profit = (current_price - entry_price) * setup.position_size
-                profit_per_share = current_price - entry_price
-            else:  # SHORT
-                dollar_profit = (entry_price - current_price) * setup.position_size
-                profit_per_share = entry_price - current_price
-
-            # Determine new stop price based on dollar profit tiers
-            # IMPORTANT: Stops lock at profit - $30 buffer to give room
-            # Example: At $80 profit → locks $50 (has $30 buffer)
-
-            new_stop_price = None
-            tier_name = None
-            locked_profit = 0.0
-
-            BUFFER = 30.0  # Always maintain $30 buffer above locked profit
-
-            # QUICK PROFIT PROTECTION: If hit $20+ profit within first 10 minutes, immediately lock breakeven
-            position_age = position_data.get('age_seconds', 999999)
-            if dollar_profit >= self.quick_profit_threshold and position_age <= self.quick_profit_time_window:
-                # Quick profit detected - immediate breakeven protection
-                if not position_data.get('has_trailing_stop'):  # Only if not already protected
-                    locked_profit = 0.0
-                    tier_name = f"Quick Profit Protection (${dollar_profit:.0f} in {int(position_age/60)}min)"
-                    logger.info(f"⚡ {symbol}: QUICK PROFIT - Moving to breakeven immediately!")
-
-            elif dollar_profit >= self.breakeven_profit_threshold:
-                # Calculate locked profit with buffer
-                if dollar_profit < (self.tier1_profit_threshold + BUFFER):
-                    # Between $30-$79: Lock breakeven only
-                    locked_profit = 0.0
-                    tier_name = "Breakeven ($30 reached)"
-                else:
-                    # $80+: Lock in $50 increments with $30 buffer
-                    # Formula: locked_profit = floor((current_profit - buffer) / increment) * increment
-                    profit_above_buffer = dollar_profit - BUFFER
-                    increments = int(profit_above_buffer // self.profit_increment)
-                    locked_profit = increments * self.profit_increment
-
-                    if locked_profit >= 100:
-                        tier_name = f"$100+ Tier (${int(locked_profit)} locked, ${int(dollar_profit - locked_profit)} buffer)"
-                    else:
-                        tier_name = f"${int(locked_profit)} Locked (${int(dollar_profit - locked_profit)} buffer)"
-
-            # Calculate new stop price to lock in the profit
-            if tier_name:
-                if setup.signal_type == SignalType.LONG:
-                    new_stop_price = entry_price + (locked_profit / setup.position_size)
-                else:  # SHORT
-                    new_stop_price = entry_price - (locked_profit / setup.position_size)
-
-                # Check if this is an improvement over current stop
-                current_locked_profit = position_data.get('locked_profit', -999999)
-
-                # Only upgrade if we're locking in MORE profit than before
-                if locked_profit > current_locked_profit:
-                    action = "Upgrading" if position_data.get('has_trailing_stop') else "Activating"
-                    logger.info(f"💰 {symbol}: {action} stop to lock ${locked_profit:.0f} profit - {tier_name}")
-                    logger.info(f"   Current profit: ${dollar_profit:.2f}")
-                    logger.info(f"   Entry: ${entry_price:.2f} → Current: ${current_price:.2f}")
-                    logger.info(f"   New stop: ${new_stop_price:.2f}")
-
-                    # Get parent order ID
-                    parent_order_id = position_data.get('order_id')
-                    if not parent_order_id:
-                        logger.warning(f"{symbol}: No parent order ID found")
-                        return False
-
-                    # Cancel existing stop
-                    if position_data.get('has_trailing_stop'):
-                        old_stop_id = position_data.get('trailing_stop_id')
-                        if old_stop_id:
-                            logger.info(f"{symbol}: Cancelling old stop...")
-                            order_manager.cancel_order(old_stop_id)
-                    else:
-                        logger.info(f"{symbol}: Cancelling fixed stop loss...")
-                        order_manager.cancel_stop_loss_leg(parent_order_id)
-
-                    # Place new stop loss order at the calculated price
-                    side = 'sell' if setup.signal_type == SignalType.LONG else 'buy'
-
-                    new_stop_id = order_manager.place_stop_loss(
-                        symbol=symbol,
-                        side=side,
-                        quantity=setup.position_size,
-                        stop_price=new_stop_price,
-                        trade_id=position_data.get('trade_id')
-                    )
-
-                    if new_stop_id:
-                        # Mark position as upgraded
-                        position_data['has_trailing_stop'] = True
-                        position_data['trailing_stop_id'] = new_stop_id
-                        position_data['locked_profit'] = locked_profit
-                        position_data['stop_price'] = new_stop_price
-                        position_data['upgraded_at_profit'] = dollar_profit
-                        position_data['tier'] = tier_name
-
-                        logger.info(f"✅ {symbol}: STOP UPGRADED - ${locked_profit:.0f} profit protected!")
-                        return True
-                    else:
-                        logger.error(f"❌ {symbol}: Failed to place new stop")
-                        return False
-
-            return False
-
-        except Exception as e:
-            logger.error(f"Error upgrading {symbol} stop: {e}")
+            logger.error(f"❌ Error creating position record for {setup.symbol}: {e}")
             import traceback
             logger.error(traceback.format_exc())
-            return False
+            return ""
 
     def _track_stop_out(self, symbol: str) -> None:
         """
@@ -1230,7 +1240,7 @@ class ProprietaryStrategy:
         """
         Force close a position immediately with a market order.
 
-        This cancels all associated orders (bracket legs, trailing stops) and
+        This cancels all associated orders (trailing stops, take profit limits) and
         exits the position at market price.
 
         Args:
@@ -1251,19 +1261,21 @@ class ProprietaryStrategy:
             logger.info(f"   Position size: {setup.position_size} shares")
             logger.info(f"   Entry: ${setup.entry_price:.2f}")
 
-            # Step 1: Cancel all open orders for this symbol
+            # Step 1: Cancel ALL open orders for this symbol (including orphaned take-profits)
             try:
-                # Cancel parent order and all legs
-                parent_order_id = position_data.get('order_id')
-                if parent_order_id:
-                    logger.info(f"{symbol}: Cancelling parent order {parent_order_id} and all legs...")
-                    order_manager.cancel_order(parent_order_id)
+                logger.info(f"{symbol}: Cancelling ALL open orders for this symbol...")
 
-                # Cancel trailing stop if present
-                trailing_stop_id = position_data.get('trailing_stop_id')
-                if trailing_stop_id:
-                    logger.info(f"{symbol}: Cancelling trailing stop {trailing_stop_id}...")
-                    order_manager.cancel_order(trailing_stop_id)
+                # Get all open orders for this symbol
+                open_orders = order_manager.api.list_orders(status='open', symbols=symbol)
+
+                if open_orders:
+                    logger.info(f"{symbol}: Found {len(open_orders)} open orders to cancel")
+                    for order in open_orders:
+                        logger.info(f"  Cancelling {order.type} order {order.id} ({order.side} @ ${order.limit_price if order.limit_price else order.stop_price})")
+                        order_manager.cancel_order(order.id)
+                    logger.info(f"✅ {symbol}: All open orders cancelled")
+                else:
+                    logger.info(f"{symbol}: No open orders to cancel")
 
             except Exception as e:
                 logger.warning(f"{symbol}: Error cancelling orders: {e} (continuing with position close)")
@@ -1315,15 +1327,112 @@ class ProprietaryStrategy:
 
     async def monitor_positions(self) -> List[Dict[str, Any]]:
         """
-        Monitor active positions and upgrade to trailing stops when profitable.
+        Monitor active positions and their trailing stops.
 
-        With trailing stops enabled:
-        1. Monitors positions for profitability
-        2. Upgrades to trailing stop once profit threshold reached
+        Functions:
+        1. Syncs existing Alpaca positions into tracking system
+        2. Monitors positions for current P/L
         3. Logs position status with trailing stop indicators
-        4. Force closes all positions after 1 PM EST cutoff
+        4. Force closes all positions after cutoff time (3:50 PM EST)
+
+        Note: Trailing stops are placed automatically after entry fills.
         """
+        logger.info(f"🔍 monitor_positions() called - checking for positions to monitor")
         exit_signals = []
+
+        # SYNC EXISTING ALPACA POSITIONS INTO self.active_positions
+        # This handles positions that existed before bot restart
+        try:
+            logger.info(f"🔄 Checking for Alpaca positions to sync... (tracking {len(self.active_positions)} internally)")
+            alpaca_positions = order_manager.get_open_positions()
+            logger.info(f"🔄 Found {len(alpaca_positions) if alpaca_positions else 0} Alpaca positions")
+
+            if alpaca_positions:
+                for alpaca_pos in alpaca_positions:
+                    symbol = alpaca_pos.get('symbol')
+
+                    # If position exists in Alpaca but not in our tracking dict, add it
+                    if symbol and symbol not in self.active_positions:
+                        logger.info(f"🔄 {symbol}: Syncing existing Alpaca position into tracking system...")
+
+                        # Create minimal TradeSetup from Alpaca position data
+                        qty = abs(alpaca_pos.get('qty', 0))
+                        entry_price = float(alpaca_pos.get('avg_entry_price', 0))
+                        current_price = float(alpaca_pos.get('current_price', entry_price))
+                        unrealized_pl = float(alpaca_pos.get('unrealized_pl', 0))
+                        side = alpaca_pos.get('side', 'long')
+
+                        # Calculate ATR-based stops (fallback if we don't have original)
+                        df = market_data_service.get_bars(symbol, timeframe='5Min', limit=100)
+                        if df is not None and len(df) > 0:
+                            atr = self.indicators.calculate_atr(df, period=14)
+                            current_atr = atr.iloc[-1] if not atr.empty else (entry_price * 0.02)
+                        else:
+                            current_atr = entry_price * 0.02  # 2% fallback
+
+                        stop_distance = max(current_atr * self.atr_stop_multiplier, 0.30, entry_price * 0.012)
+
+                        if side == 'long':
+                            stop_loss = entry_price - stop_distance
+                            target_price = entry_price + (stop_distance * 2.5)
+                            signal_type = SignalType.LONG
+                        else:
+                            stop_loss = entry_price + stop_distance
+                            target_price = entry_price - (stop_distance * 2.5)
+                            signal_type = SignalType.SHORT
+
+                        # Create minimal TradeSetup
+                        est = pytz.timezone('US/Eastern')
+                        synced_setup = TradeSetup(
+                            symbol=symbol,
+                            signal_type=signal_type,
+                            entry_price=entry_price,
+                            stop_loss=stop_loss,
+                            target_price=target_price,
+                            position_size=int(qty),
+                            gap_percent=0.0,  # Unknown for synced positions
+                            volume_ratio=0.0,  # Unknown
+                            rsi_value=50.0,  # Unknown
+                            macd_value=0.0,  # Unknown
+                            macd_signal=0.0,  # Unknown
+                            macd_histogram=0.0,  # Unknown
+                            atr_value=current_atr,
+                            has_macd_divergence=False,
+                            divergence_type='none',
+                            signal_strength=7,  # Assume valid
+                            setup_reasons=['Synced from existing position'],
+                            confidence_score=0.7,
+                            timestamp=datetime.now(est)  # Add required timestamp field
+                        )
+
+                        # Check if position already has a trailing stop
+                        has_existing_trailing = False
+                        try:
+                            orders = order_manager.api.list_orders(status='open', symbols=symbol)
+                            for order in orders:
+                                if order.type == 'trailing_stop':
+                                    has_existing_trailing = True
+                                    logger.info(f"✅ {symbol}: Already has trailing stop - will not upgrade again")
+                                    break
+                        except Exception as e:
+                            logger.warning(f"{symbol}: Could not check for existing trailing stops: {e}")
+
+                        # Add to tracking (est already declared above)
+                        self.active_positions[symbol] = {
+                            'setup': synced_setup,
+                            'trade_id': None,  # Unknown for synced positions
+                            'order_id': None,  # Unknown
+                            'entry_time': datetime.now(est) - timedelta(minutes=30),  # Assume entered 30 min ago
+                            'synced_from_alpaca': True,  # Flag to identify synced positions
+                            'has_trailing_stop': has_existing_trailing,  # Check if already has trailing stop
+                            'trailing_stop_id': None,
+                            'tier': '🔄 Native Trailing Stop' if has_existing_trailing else '📍 Fixed Stop'
+                        }
+
+                        logger.info(f"✅ {symbol}: Synced into tracking - Entry: ${entry_price:.2f}, Stop: ${stop_loss:.2f}, Profit: ${unrealized_pl:.2f}")
+                        logger.info(f"   Current: ${current_price:.2f}, Has trailing stop: {has_existing_trailing}")
+        except Exception as e:
+            logger.warning(f"Error syncing Alpaca positions: {e}")
 
         # Check if we should force close all positions due to time cutoff
         if self._should_close_all_positions():
@@ -1342,13 +1451,20 @@ class ProprietaryStrategy:
                 logger.warning(f"✅ All positions closed due to time cutoff")
                 return exit_signals
 
+        # Log active position monitoring
+        if len(self.active_positions) > 0:
+            logger.info(f"💼 Monitoring {len(self.active_positions)} active position(s): {list(self.active_positions.keys())}")
+            if self.enable_trailing_stops:
+                logger.info(f"   🔄 Trailing stops ENABLED - checking for upgrade opportunities")
+            else:
+                logger.info(f"   ❌ Trailing stops DISABLED")
+
         for symbol, pos_data in list(self.active_positions.items()):
             try:
                 setup: TradeSetup = pos_data['setup']
 
-                # Check if position needs trailing stop upgrade
-                if self.enable_trailing_stops and not pos_data.get('has_trailing_stop', False):
-                    await self.upgrade_to_trailing_stop(symbol, pos_data)
+                # NOTE: Trailing stops are placed automatically via OTO orders - no upgrade needed!
+                # Positions already have trailing stops from entry via OTO order class
 
                 # Get current price for logging
                 df = market_data_service.get_bars(symbol, timeframe='1Min', limit=5)
@@ -1362,15 +1478,10 @@ class ProprietaryStrategy:
 
                     profit_pct = (pnl / (setup.entry_price * setup.position_size)) * 100
 
-                    # Log position status with dollar profit
+                    # Log position status with trailing stop indicator
                     stop_status = pos_data.get('tier', '📍 Fixed Stop')
-                    locked_profit = pos_data.get('locked_profit', 0.0)
 
                     logger.info(f"💼 {symbol}: ${current_price:.2f} | P/L: ${pnl:.2f} ({profit_pct:+.2f}%) | {stop_status}")
-
-                    # Log stop protection level
-                    if pos_data.get('has_trailing_stop') and locked_profit > 0:
-                        logger.info(f"   🛡️ Protected: ${locked_profit:.0f} minimum")
 
             except Exception as e:
                 logger.error(f"Error monitoring position {symbol}: {e}")
@@ -1382,18 +1493,27 @@ class ProprietaryStrategy:
         """Add a gap setup to active monitoring."""
         try:
             symbol = setup_data.get('symbol')
-            if not symbol or symbol in self.active_setups:
+            if not symbol:
+                logger.debug(f"add_gap_setup: No symbol provided")
+                return False
+
+            if symbol in self.active_setups:
+                logger.debug(f"add_gap_setup: {symbol} already in active setups, skipping")
                 return False
 
             # Check time restriction
             if not self._check_time_restriction():
+                logger.info(f"add_gap_setup: {symbol} blocked by time restriction")
                 return False
 
+            logger.info(f"🔍 Analyzing {symbol} for gap setup (Gap: {setup_data.get('gap_percent', 0):.1f}%)")
+
             # Run full analysis
-            df = market_data_service.get_bars(symbol, timeframe='5Min', limit=100)
+            df = market_data_service.get_bars(symbol, timeframe='5Min', limit=300)  # Increased for better MACD calculation
             df_daily = market_data_service.get_bars(symbol, timeframe='1Day', limit=100)
 
             if df is None or df_daily is None or len(df) < 50:
+                logger.warning(f"⚠️ {symbol}: Insufficient historical data for analysis")
                 return False
 
             gap_data = {
@@ -1408,13 +1528,23 @@ class ProprietaryStrategy:
 
             if setup:
                 self.active_setups[symbol] = setup
-                logger.info(f"✅ Gap setup added: {symbol} - {setup.signal_type.value}")
+                logger.info(f"✅ Gap setup added: {symbol} - {setup.signal_type.value} (strength: {setup.signal_strength}/10)")
+                analysis_logger._add_log(
+                    'success',
+                    f"Setup added: {setup.signal_type.value} entry at ${setup.entry_price:.2f}",
+                    symbol,
+                    analysis_logger._get_trading_time()
+                )
                 return True
+            else:
+                logger.info(f"❌ {symbol}: Setup analysis failed - no valid signal generated")
 
             return False
 
         except Exception as e:
-            logger.error(f"Error adding gap setup: {e}")
+            logger.error(f"Error adding gap setup for {symbol}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return False
 
 
