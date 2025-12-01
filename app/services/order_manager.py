@@ -434,8 +434,18 @@ class OrderManagerService:
             logger.error(f"Error placing stop-loss order for {symbol}: {e}")
             return None
     
-    def place_limit_order(self, symbol: str, side: str, quantity: int, limit_price: float, trade_id: str = None) -> Optional[str]:
-        """Place a limit order."""
+    def place_limit_order(self, symbol: str, side: str, quantity: int, limit_price: float, trade_id: str = None, time_in_force: str = None) -> Optional[str]:
+        """
+        Place a limit order.
+
+        Args:
+            symbol: Stock symbol
+            side: 'buy' or 'sell'
+            quantity: Number of shares
+            limit_price: Limit price
+            trade_id: Optional trade ID for tracking
+            time_in_force: 'day' or 'gtc' (defaults to 'gtc' for take profit orders)
+        """
         try:
             if quantity <= 0 or limit_price <= 0:
                 logger.error(f"Invalid parameters for limit order {symbol}: qty={quantity}, price=${limit_price}")
@@ -444,7 +454,10 @@ class OrderManagerService:
             # Round price to 2 decimal places
             limit_price = round(limit_price, 2)
 
-            logger.info(f"Placing limit order: {side} {quantity} shares of {symbol} at ${limit_price}")
+            # Default to GTC for take profit orders (so they don't expire at end of day)
+            tif = time_in_force if time_in_force else TimeInForce.GTC.value
+
+            logger.info(f"Placing limit order: {side} {quantity} shares of {symbol} at ${limit_price} (TIF: {tif})")
 
             order = self.api.submit_order(
                 symbol=symbol,
@@ -452,7 +465,7 @@ class OrderManagerService:
                 side=side.lower(),
                 type=OrderType.LIMIT.value,
                 limit_price=limit_price,
-                time_in_force=TimeInForce.DAY.value
+                time_in_force=tif
             )
             
             # Track the order
