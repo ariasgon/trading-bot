@@ -150,15 +150,24 @@ class ProprietaryStrategy:
         self.position_close_hour = 15  # Close all positions by 3:50 PM EST
         self.position_close_minute = 50  # Close at exactly 3:50 PM
 
+        # Market open volatility avoidance - don't enter in first 30 minutes
+        self.market_open_delay_minutes = 30  # Wait 30 minutes after market open before entering trades
+
         # ALPACA NATIVE TRAILING STOPS
         # Uses OTO orders with trail_price (dollar amount trailing)
         # Alpaca automatically adjusts stop as price moves favorably
         # Stop distance = ATR-based (same as initial stop loss distance)
         self.enable_trailing_stops = True       # Use Alpaca's automatic trailing stops
 
-        # Whipsaw prevention
+        # Whipsaw prevention - cooldown after ANY trade exit (not just stop-outs)
         self.stop_out_cooldown = 3600            # 60 minutes (1 hour) cooldown after stop out to prevent whipsaws (seconds)
+        self.trade_exit_cooldown = 1800          # 30 minutes cooldown after ANY trade exit (limit fills, take profits, etc.)
         self.recent_stop_outs: Dict[str, float] = {}  # Track stop out timestamps by symbol
+        self.recent_trade_exits: Dict[str, float] = {}  # Track ANY trade exit timestamps by symbol
+
+        # Duplicate order prevention
+        self.pending_order_symbols: Dict[str, float] = {}  # Track symbols with pending orders (value = timestamp)
+        self.pending_order_timeout = 300  # 5 minutes - after this, allow new orders even if old one didn't fill
 
         # Profit target multipliers (adjusted for tighter stops)
         self.profit_target_multiplier = 2.5      # Target = 2.5x initial risk
@@ -236,14 +245,31 @@ class ProprietaryStrategy:
             return 0.0
 
     def _check_time_restriction(self) -> bool:
-        """Check if current time is within trading hours."""
+        """Check if current time is within trading hours (after open delay, before cutoff)."""
         try:
             est = pytz.timezone('US/Eastern')
             current_time_est = datetime.now(est).time()
+
+            # Market opens at 9:30 AM EST
+            market_open = time(9, 30)
+
+            # Calculate earliest entry time (market open + delay)
+            earliest_entry_minutes = 9 * 60 + 30 + self.market_open_delay_minutes
+            earliest_entry_hour = earliest_entry_minutes // 60
+            earliest_entry_minute = earliest_entry_minutes % 60
+            earliest_entry_time = time(earliest_entry_hour, earliest_entry_minute)
+
             cutoff_time = time(self.trading_cutoff_hour, 0)
 
+            # Check if before market open + delay period
+            if current_time_est < earliest_entry_time:
+                minutes_until_entry = (earliest_entry_hour * 60 + earliest_entry_minute) - (current_time_est.hour * 60 + current_time_est.minute)
+                logger.info(f"⏰ Waiting for market open volatility to settle ({minutes_until_entry} mins until {earliest_entry_time.strftime('%H:%M')} EST)")
+                return False
+
+            # Check if after cutoff
             if current_time_est >= cutoff_time:
-                logger.info(f"⏰ Trading cutoff reached ({self.trading_cutoff_hour} PM EST) - no new trades")
+                logger.info(f"⏰ Trading cutoff reached ({self.trading_cutoff_hour}:00 PM EST) - no new trades")
                 return False
 
             return True
@@ -446,6 +472,17 @@ class ProprietaryStrategy:
                     else:
                         # Cooldown expired, remove from tracking
                         del self.recent_stop_outs[symbol]
+
+                # CHURNING PREVENTION: Check cooldown after ANY trade exit
+                if symbol in self.recent_trade_exits:
+                    time_since_exit = time_module.time() - self.recent_trade_exits[symbol]
+                    if time_since_exit < self.trade_exit_cooldown:
+                        remaining = int(self.trade_exit_cooldown - time_since_exit)
+                        logger.debug(f"⏸️ {symbol} in cooldown after trade exit ({remaining}s remaining)")
+                        continue
+                    else:
+                        # Cooldown expired, remove from tracking
+                        del self.recent_trade_exits[symbol]
 
                 # Get market data
                 df_daily = market_data_service.get_bars(symbol, timeframe='1Day', limit=100)
@@ -1024,6 +1061,21 @@ class ProprietaryStrategy:
         try:
             setup: TradeSetup = signal['setup']
 
+            # DUPLICATE ORDER PREVENTION: Check if we already have a pending order for this symbol
+            if setup.symbol in self.pending_order_symbols:
+                pending_time = self.pending_order_symbols[setup.symbol]
+                elapsed = time_module.time() - pending_time
+                if elapsed < self.pending_order_timeout:
+                    signal_dir = "LONG" if setup.signal_type == SignalType.LONG else "SHORT"
+                    rejection_msg = f"REJECTED [{signal_dir}] - Pending order already exists ({int(elapsed)}s ago)"
+                    logger.warning(f"❌ {setup.symbol}: {rejection_msg}")
+                    analysis_logger._add_log('warning', rejection_msg, setup.symbol, analysis_logger._get_trading_time())
+                    return None
+                else:
+                    # Pending order timed out, allow new order
+                    del self.pending_order_symbols[setup.symbol]
+                    logger.info(f"ℹ️ {setup.symbol}: Previous pending order timed out, allowing new order")
+
             # Final time check
             if not self._check_time_restriction():
                 signal_dir = "LONG" if setup.signal_type == SignalType.LONG else "SHORT"
@@ -1116,6 +1168,9 @@ class ProprietaryStrategy:
             if order_id:
                 # Remove from active setups
                 self.active_setups.pop(setup.symbol, None)
+
+                # Track pending order to prevent duplicates
+                self.pending_order_symbols[setup.symbol] = time_module.time()
 
                 logger.info(f"✅ TRADE PLACED: {setup.symbol} {side} {setup.position_size} shares")
                 logger.info(f"   Entry Order ID: {order_id}")
@@ -1236,6 +1291,17 @@ class ProprietaryStrategy:
         self.recent_stop_outs[symbol] = time_module.time()
         logger.info(f"🛑 {symbol}: Stopped out - cooldown activated for {int(self.stop_out_cooldown/60)} minutes")
 
+    def _track_trade_exit(self, symbol: str, reason: str = "trade exit") -> None:
+        """
+        Track when ANY trade exits to prevent churning (re-entry on same symbol too quickly).
+
+        Args:
+            symbol: Stock symbol that was exited
+            reason: Reason for exit (for logging)
+        """
+        self.recent_trade_exits[symbol] = time_module.time()
+        logger.info(f"📤 {symbol}: Trade exit ({reason}) - cooldown activated for {int(self.trade_exit_cooldown/60)} minutes")
+
     async def force_close_position(self, symbol: str, position_data: Dict, reason: str = "Time cutoff") -> bool:
         """
         Force close a position immediately with a market order.
@@ -1252,9 +1318,13 @@ class ProprietaryStrategy:
             True if successfully closed, False otherwise
         """
         try:
-            # Track stop out if this is a stop loss trigger (not time cutoff)
+            # Track stop out if this is a stop loss trigger
             if "stop" in reason.lower():
                 self._track_stop_out(symbol)
+
+            # Track ALL trade exits to prevent churning
+            self._track_trade_exit(symbol, reason)
+
             setup: TradeSetup = position_data['setup']
 
             logger.info(f"⏰ {symbol}: FORCE CLOSING POSITION - {reason}")

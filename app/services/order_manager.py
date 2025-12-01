@@ -214,9 +214,14 @@ class OrderManagerService:
             trail_price_dollar = None
             if use_trailing_stop:
                 # Calculate trail_price from stop_loss distance (ATR-based)
-                # Initial stop = 2x ATR, Trailing stop = 1.5x ATR (tighter for faster profit locking)
-                stop_distance = abs(entry_price - stop_loss)  # This is 2x ATR
-                trail_price_dollar = round(stop_distance * 0.75, 2)  # 75% of stop distance = 1.5x ATR
+                # WIDENED: Use 100% of stop distance (same as initial stop) to prevent premature exits
+                # Previous: 75% was too tight, causing immediate stop-outs on normal volatility
+                stop_distance = abs(entry_price - stop_loss)  # This is the ATR-based stop distance
+                trail_price_dollar = round(stop_distance * 1.0, 2)  # 100% of stop distance for breathing room
+
+                # Minimum trail distance: $1.50 for stocks under $50, 2.5% for higher priced stocks
+                min_trail_dollar = max(1.50, entry_price * 0.025)
+                trail_price_dollar = max(trail_price_dollar, round(min_trail_dollar, 2))
 
             # Log what we're placing
             logger.info(f"🎯 Placing ENTRY ORDER ({order_type.upper()}): {side} {quantity} {symbol}")
@@ -272,7 +277,9 @@ class OrderManagerService:
                 "trail_price": trail_price_dollar,
                 "status": order.status,
                 "submitted_at": datetime.now().isoformat(),
-                "trade_id": trade_id
+                "trade_id": trade_id,
+                "needs_stops": True,  # Flag that this order needs stops after fill
+                "stops_placed": False  # Track whether stops have been placed
             }
 
             self.pending_orders[order.id] = order_data
@@ -317,8 +324,8 @@ class OrderManagerService:
 
             logger.info(f"🔍 {symbol}: Monitoring order {order_id} for fill...")
 
-            # Poll order status until filled (max 60 seconds)
-            max_checks = 60
+            # Poll order status until filled (max 5 minutes for limit orders)
+            max_checks = 300  # 5 minutes = 300 seconds
             for i in range(max_checks):
                 try:
                     order = self.api.get_order(order_id)
@@ -357,6 +364,12 @@ class OrderManagerService:
                         else:
                             logger.error(f"❌ {symbol}: Failed to place take profit!")
 
+                        # Mark stops as placed
+                        cached_order = redis_cache.get(f"order:{order_id}")
+                        if cached_order:
+                            cached_order['stops_placed'] = True
+                            redis_cache.set(f"order:{order_id}", cached_order, expiration=86400)
+
                         logger.info(f"🎯 {symbol}: Position fully protected with trailing stop + TP")
                         return
 
@@ -370,7 +383,7 @@ class OrderManagerService:
                 # Wait 1 second before next check
                 await asyncio.sleep(1)
 
-            logger.warning(f"⏰ {symbol}: Entry order not filled after {max_checks} seconds")
+            logger.warning(f"⏰ {symbol}: Entry order not filled after {max_checks} seconds (will be handled by periodic checker)")
 
         except Exception as e:
             logger.error(f"Error in _place_trailing_stop_after_fill for {symbol}: {e}")
@@ -912,6 +925,130 @@ class OrderManagerService:
         except Exception as e:
             logger.error(f"Error getting recent orders: {e}")
             return []
+
+    async def check_and_place_missing_stops(self) -> Dict[str, Any]:
+        """
+        Periodic checker to ensure all filled entry orders have stops placed.
+
+        This is the safety net that catches any orders missed by the async monitor.
+        Should be called periodically (every 1-2 minutes) by the trading bot.
+
+        Returns:
+            Dict with stats about stops placed
+        """
+        try:
+            stats = {
+                "checked": 0,
+                "stops_placed": 0,
+                "errors": 0,
+                "orders_processed": []
+            }
+
+            # Get all recent orders (last 100)
+            try:
+                orders = self.api.list_orders(status='all', limit=100)
+            except Exception as e:
+                logger.error(f"Error fetching orders for stop check: {e}")
+                return stats
+
+            for order in orders:
+                try:
+                    # Get cached order data
+                    cached_order = redis_cache.get(f"order:{order.id}")
+
+                    if not cached_order:
+                        continue
+
+                    # Only process orders that need stops but don't have them yet
+                    if not cached_order.get('needs_stops', False):
+                        continue
+
+                    if cached_order.get('stops_placed', False):
+                        continue
+
+                    stats["checked"] += 1
+
+                    # Check if order is filled
+                    if order.status != 'filled':
+                        continue
+
+                    # Order is filled but missing stops - place them now!
+                    symbol = order.symbol
+                    quantity = int(order.filled_qty) if order.filled_qty else int(order.qty)
+                    entry_side = cached_order.get('side', order.side)
+                    exit_side = 'sell' if entry_side == 'buy' else 'buy'
+
+                    trail_price = cached_order.get('trail_price')
+                    take_profit = cached_order.get('take_profit')
+                    trade_id = cached_order.get('trade_id')
+
+                    if not trail_price or not take_profit:
+                        logger.warning(f"⚠️ {symbol}: Order {order.id} missing stop/TP data in cache")
+                        continue
+
+                    logger.warning(f"🔧 {symbol}: PLACING MISSING STOPS for order {order.id[:8]} (filled but no stops)")
+
+                    # Place trailing stop
+                    trailing_stop_id = self.place_trailing_stop(
+                        symbol=symbol,
+                        side=exit_side,
+                        quantity=quantity,
+                        trail_price=trail_price,
+                        trade_id=trade_id
+                    )
+
+                    if trailing_stop_id:
+                        logger.info(f"✅ {symbol}: Missing trailing stop placed: {trailing_stop_id}")
+                    else:
+                        logger.error(f"❌ {symbol}: Failed to place missing trailing stop")
+                        stats["errors"] += 1
+                        continue
+
+                    # Place take profit
+                    tp_id = self.place_limit_order(
+                        symbol=symbol,
+                        side=exit_side,
+                        quantity=quantity,
+                        limit_price=take_profit,
+                        trade_id=trade_id
+                    )
+
+                    if tp_id:
+                        logger.info(f"✅ {symbol}: Missing take profit placed: {tp_id}")
+                    else:
+                        logger.error(f"❌ {symbol}: Failed to place missing take profit")
+                        stats["errors"] += 1
+                        continue
+
+                    # Mark stops as placed
+                    cached_order['stops_placed'] = True
+                    redis_cache.set(f"order:{order.id}", cached_order, expiration=86400)
+
+                    stats["stops_placed"] += 1
+                    stats["orders_processed"].append({
+                        "symbol": symbol,
+                        "order_id": order.id,
+                        "trailing_stop_id": trailing_stop_id,
+                        "take_profit_id": tp_id
+                    })
+
+                    logger.info(f"🎯 {symbol}: Missing stops successfully placed via periodic checker")
+
+                except Exception as e:
+                    logger.error(f"Error processing order {order.id} in periodic checker: {e}")
+                    stats["errors"] += 1
+                    continue
+
+            if stats["stops_placed"] > 0:
+                logger.warning(f"🔧 Periodic checker placed stops for {stats['stops_placed']} orders that were missed")
+
+            return stats
+
+        except Exception as e:
+            logger.error(f"Error in periodic fill checker: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"error": str(e)}
 
     def health_check(self) -> bool:
         """Check if order management service is healthy."""

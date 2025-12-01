@@ -11,12 +11,13 @@ A sophisticated, fully-automated trading bot built with Python and FastAPI that 
 ### Core Trading Features
 - **Automated Gap Trading** - Detects and trades stocks with significant overnight gaps (0.75% - 20%)
 - **MACD with Divergence Detection** - Advanced momentum analysis with 20-bar divergence lookback
-- **Volume Confirmation** - Requires 2x average volume for entry validation (CRITICAL)
+- **Volume Confirmation** - Requires 1.5x average volume for entry validation (CRITICAL)
 - **RSI Filtering** - Prevents entries in extreme overbought/oversold conditions
 - **Dollar-Based Trailing Stops** - Intelligent profit protection with $15/$50/$100 tiers
-- **Real-time Market Scanning** - Continuous monitoring of 30+ symbols
+- **Real-time Market Scanning** - Continuous monitoring of 350+ S&P 500 and growth stocks
 - **Adaptive Risk Management** - Position sizing based on ATR with minimum stop distances
-- **Whipsaw Prevention** - 20-minute cooldown after stop outs
+- **Whipsaw Prevention** - 60-minute cooldown after stop outs, 30-minute after any exit
+- **Market Open Delay** - Waits 30 minutes after open to avoid volatility spikes
 
 ### Advanced Stop Loss System
 - **Minimum Stop Distance** - $0.30 or 1.2% of price (prevents noise stops)
@@ -199,7 +200,7 @@ MAX_CONCURRENT_POSITIONS=5      # Maximum concurrent positions
 # Strategy Settings (Proprietary Gap + MACD)
 MIN_GAP_PERCENT=0.75            # Minimum gap size
 MAX_GAP_PERCENT=20.0            # Maximum gap size
-MIN_VOLUME_RATIO=2.0            # CRITICAL: Must be 2x average volume
+MIN_VOLUME_RATIO=1.5            # CRITICAL: Must be 1.5x average volume
 ATR_STOP_MULTIPLIER=1.5         # Initial stop distance (1.5x ATR)
 
 # Trailing Stop Settings (Dollar-Based)
@@ -226,14 +227,14 @@ Based on research showing 73-74% win rate for this indicator combination.
 
 **Entry Rules (LONG):**
 1. ✅ Gap up detected (0.75% - 20%)
-2. ✅ Volume > 2x average (CRITICAL - cumulative daily volume check)
+2. ✅ Volume > 1.5x average (CRITICAL - cumulative daily volume check)
 3. ✅ RSI < 70 (not overbought)
 4. ✅ MACD bullish crossover OR bullish divergence (20-bar lookback)
 5. ✅ Time: Before 2 PM EST
 
 **Entry Rules (SHORT):**
 1. ✅ Gap down detected (0.75% - 20%)
-2. ✅ Volume > 2x average (CRITICAL - cumulative daily volume check)
+2. ✅ Volume > 1.5x average (CRITICAL - cumulative daily volume check)
 3. ✅ RSI > 30 (not oversold)
 4. ✅ MACD bearish crossover OR bearish divergence (20-bar lookback)
 5. ✅ Time: Before 2 PM EST
@@ -334,7 +335,7 @@ The bot tracks comprehensive performance metrics:
 - Verify market is open (9:30 AM - 4:00 PM ET)
 - Check that it's before 2 PM EST (trading cutoff)
 - Review bot logs for entry conditions not met
-- Most common: Volume < 2x average (very restrictive filter)
+- Most common: Volume < 1.5x average (strict quality filter)
 - Ensure account has sufficient buying power
 - Check watchlist has active stocks
 
@@ -495,6 +496,15 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ## 📝 Recent Updates
 
+### December 2025 - Anti-Churning & Stop Loss Improvements
+- ✅ Widened trailing stop distance to 100% of initial stop (was 75% - too tight)
+- ✅ Added minimum trail distance: $1.50 or 2.5% of price
+- ✅ Implemented 30-minute cooldown after ANY trade exit (prevents churning)
+- ✅ Added 30-minute market open delay (avoids opening volatility)
+- ✅ Added duplicate order prevention (5-minute pending order lockout)
+- ✅ Expanded stock universe to full S&P 500 (~350 symbols + growth stocks)
+- ✅ Fixed issue causing multiple entries on same symbol within minutes
+
 ### October 2025 - Major Stop Loss Overhaul
 - ✅ Fixed critical stop loss issues (increased from 0.9x to 1.5x ATR)
 - ✅ Implemented minimum stop distances ($0.30 or 1.2% of price)
@@ -511,4 +521,4 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 **Built with ❤️ by the Trading Bot Team**
 
-*Last updated: October 31, 2025*
+*Last updated: December 1, 2025*
