@@ -163,25 +163,25 @@ class OrderManagerService:
         trail_percent: Optional[float] = None
     ) -> Optional[str]:
         """
-        Place entry order with AUTOMATIC TRAILING STOP + TAKE PROFIT.
+        Place a TRUE BRACKET ORDER using Alpaca's native order_class="bracket".
 
-        Implementation:
-        1. Place entry order (limit or market)
-        2. Monitor order fill asynchronously
-        3. Once filled, immediately place trailing stop + take profit as separate orders
+        This ATOMICALLY places:
+        1. Entry order (limit or market)
+        2. Take profit order (limit) - FIXED, does not trail
+        3. Stop loss order (stop) - FIXED, does not trail
 
-        This gives us trailing stops from entry using Alpaca's native trailing stop functionality.
+        The stop and take profit are OCO (One-Cancels-Other) - when one fills, the other cancels.
 
         Args:
             symbol: Stock symbol
             side: 'buy' or 'sell'
             quantity: Number of shares
-            stop_loss: Initial stop loss price (used to calculate trail distance)
-            take_profit: Take profit price
+            stop_loss: Stop loss price (FIXED)
+            take_profit: Take profit price (FIXED)
             trade_id: Optional trade ID for tracking
             limit_price: If provided, uses limit order for entry. Otherwise uses market order.
-            use_trailing_stop: If True, uses trailing stop (default: True)
-            trail_percent: Deprecated parameter (not used - trail_price calculated from ATR)
+            use_trailing_stop: If True, uses trailing stop instead of fixed stop (default: True)
+            trail_percent: Deprecated - trail calculated from stop distance
         """
         try:
             if quantity <= 0:
@@ -210,63 +210,40 @@ class OrderManagerService:
                     # Fallback: use stop_loss to estimate entry
                     entry_price = stop_loss * 1.02 if side.lower() == 'buy' else stop_loss * 0.98
 
-            # Calculate DOLLAR-BASED trailing stop (trail_price, not trail_percent)
-            trail_price_dollar = None
-            if use_trailing_stop:
-                # Calculate trail_price from stop_loss distance (ATR-based)
-                # WIDENED: Use 100% of stop distance (same as initial stop) to prevent premature exits
-                # Previous: 75% was too tight, causing immediate stop-outs on normal volatility
-                stop_distance = abs(entry_price - stop_loss)  # This is the ATR-based stop distance
-                trail_price_dollar = round(stop_distance * 1.0, 2)  # 100% of stop distance for breathing room
-
-                # Minimum trail distance: $1.50 for stocks under $50, 2.5% for higher priced stocks
-                min_trail_dollar = max(1.50, entry_price * 0.025)
-                trail_price_dollar = max(trail_price_dollar, round(min_trail_dollar, 2))
-
             # Log what we're placing
-            logger.info(f"🎯 Placing ENTRY ORDER ({order_type.upper()}): {side} {quantity} {symbol}")
+            logger.info(f"🎯 Placing BRACKET ORDER: {side.upper()} {quantity} {symbol}")
             if limit_price:
-                logger.info(f"   Entry Limit: ${limit_price:.2f}")
-            logger.info(f"   Will place TRAILING STOP (${trail_price_dollar} trail) + TP (${take_profit:.2f}) after fill")
+                logger.info(f"   Entry: LIMIT @ ${limit_price:.2f}")
+            else:
+                logger.info(f"   Entry: MARKET (est. ${entry_price:.2f})")
+            logger.info(f"   Stop Loss: ${stop_loss:.2f} (FIXED)")
+            logger.info(f"   Take Profit: ${take_profit:.2f} (FIXED)")
 
-            # STEP 1: Place ENTRY order (simple order, no legs)
-            entry_params = {
+            # Use Alpaca's NATIVE BRACKET ORDER - this guarantees stop + TP are placed atomically
+            # order_class="bracket" creates OCO (One-Cancels-Other) legs for stop and take profit
+            order_params = {
                 'symbol': symbol,
                 'qty': quantity,
                 'side': side.lower(),
                 'type': order_type,
                 'time_in_force': TimeInForce.GTC.value,
+                'order_class': 'bracket',  # THIS IS THE KEY - native bracket order
+                'stop_loss': {'stop_price': str(stop_loss)},  # Fixed stop loss
+                'take_profit': {'limit_price': str(take_profit)}  # Fixed take profit
             }
 
-            # Add limit price if using limit order
+            # Add limit price if using limit order for entry
             if limit_price is not None:
-                entry_params['limit_price'] = str(limit_price)
+                order_params['limit_price'] = str(limit_price)
 
-            # Place simple entry order
-            order = self.api.submit_order(**entry_params)
+            # Place the bracket order - Alpaca handles everything atomically
+            order = self.api.submit_order(**order_params)
 
-            logger.info(f"✅ Entry order placed: {order.id}")
-            logger.info(f"   Monitoring for fill to place trailing stop + take profit...")
-
-            # STEP 2: Monitor for fill and place trailing stop + take profit
-            # Use threading to reliably monitor in the background (works in both sync/async contexts)
-            import threading
-
-            def monitor_and_place_stops():
-                """Background thread to monitor fill and place stops."""
-                self._sync_place_stops_after_fill(
-                    order_id=order.id,
-                    symbol=symbol,
-                    quantity=quantity,
-                    side=side.lower(),
-                    trail_price=trail_price_dollar,
-                    take_profit=take_profit,
-                    trade_id=trade_id
-                )
-
-            monitor_thread = threading.Thread(target=monitor_and_place_stops, daemon=True)
-            monitor_thread.start()
-            logger.info(f"   Background monitor started for order {order.id[:8]}...")
+            logger.info(f"✅ BRACKET ORDER PLACED SUCCESSFULLY: {order.id}")
+            logger.info(f"   Entry Order ID: {order.id}")
+            logger.info(f"   Stop Loss: ${stop_loss:.2f} (auto-placed by Alpaca)")
+            logger.info(f"   Take Profit: ${take_profit:.2f} (auto-placed by Alpaca)")
+            logger.info(f"   Both exit orders are OCO (One-Cancels-Other)")
 
             # Track the order
             order_data = {
@@ -274,17 +251,17 @@ class OrderManagerService:
                 "symbol": symbol,
                 "side": side.lower(),
                 "quantity": quantity,
-                "type": "entry_with_trailing",  # Entry order, trailing stop + TP placed after fill
+                "type": "bracket",  # Native bracket order
                 "order_type": order_type,
                 "limit_price": limit_price,
                 "stop_loss": stop_loss,
                 "take_profit": take_profit,
-                "trail_price": trail_price_dollar,
                 "status": order.status,
                 "submitted_at": datetime.now().isoformat(),
                 "trade_id": trade_id,
-                "needs_stops": True,  # Flag that this order needs stops after fill
-                "stops_placed": False  # Track whether stops have been placed
+                "needs_stops": False,  # Bracket order handles this automatically
+                "stops_placed": True,  # Already placed by Alpaca
+                "order_class": "bracket"
             }
 
             self.pending_orders[order.id] = order_data
@@ -293,11 +270,9 @@ class OrderManagerService:
             return order.id
 
         except Exception as e:
-            logger.error(f"❌ ERROR placing entry order for {symbol}: {e}")
+            logger.error(f"❌ ERROR placing bracket order for {symbol}: {e}")
             logger.error(f"   Parameters: side={side}, qty={quantity}, entry={limit_price if limit_price else 'MARKET'}")
             logger.error(f"   Stop loss: ${stop_loss}, Take profit: ${take_profit}")
-            if use_trailing_stop and trail_price_dollar:
-                logger.error(f"   Trail price: ${trail_price_dollar}")
             import traceback
             logger.error(f"Full traceback:\n{traceback.format_exc()}")
             return None

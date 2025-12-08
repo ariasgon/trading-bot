@@ -123,23 +123,29 @@ class ProprietaryStrategy:
         self.active_setups: Dict[str, TradeSetup] = {}
         self.active_positions: Dict[str, Dict] = {}
 
-        # Strategy parameters
-        self.min_gap_percent = 0.75
-        self.max_gap_percent = 20.0
-        self.min_volume_ratio = 1.5  # Volume must be 1.5x average - RESTORED to original strict requirement
-        self.atr_stop_multiplier = 1.5  # 1.5x ATR for breathing room (was 0.9 - too tight!)
-        self.min_stop_distance_dollars = 0.30  # Minimum $0.30 stop distance
-        self.min_stop_distance_percent = 1.2  # OR 1.2% of price, whichever is larger
+        # Strategy parameters - STRICTER FILTERS FOR HIGHER QUALITY TRADES
+        self.min_gap_percent = 1.0   # INCREASED from 0.75 - require meaningful gaps
+        self.max_gap_percent = 15.0  # REDUCED from 20 - avoid extreme gaps (often reversals)
+        self.min_volume_ratio = 2.0  # INCREASED from 1.5 - require strong volume confirmation
+        self.atr_stop_multiplier = 1.5  # 1.5x ATR for breathing room
+        self.min_stop_distance_dollars = 0.50  # INCREASED from 0.30 - avoid tight stops
+        self.min_stop_distance_percent = 1.5  # INCREASED from 1.2 - ensure meaningful stop distance
 
-        # RSI thresholds
-        self.rsi_overbought = 70
-        self.rsi_oversold = 30
+        # RSI thresholds - TIGHTENED for better entries
+        self.rsi_overbought = 65  # REDUCED from 70 - more conservative for longs
+        self.rsi_oversold = 35    # INCREASED from 30 - more conservative for shorts
+        self.rsi_neutral_low = 40   # NEW: RSI should be in momentum zone
+        self.rsi_neutral_high = 60  # NEW: RSI should be in momentum zone
 
         # MACD parameters
         self.macd_fast = 12
         self.macd_slow = 26
         self.macd_signal = 9
         self.divergence_lookback = 20  # Look back 20 bars for divergence
+
+        # NEW: Trend confirmation using EMA
+        self.trend_ema_period = 20  # 20-period EMA for trend direction
+        self.require_trend_alignment = True  # Only trade with the trend
 
         # Risk Management
         self.max_daily_loss = 540.0  # Max $540 potential loss per day (reduced by 10% from $600)
@@ -169,9 +175,12 @@ class ProprietaryStrategy:
         self.pending_order_symbols: Dict[str, float] = {}  # Track symbols with pending orders (value = timestamp)
         self.pending_order_timeout = 300  # 5 minutes - after this, allow new orders even if old one didn't fill
 
-        # Profit target multipliers (adjusted for tighter stops)
-        self.profit_target_multiplier = 2.5      # Target = 2.5x initial risk
-        self.aggressive_target_multiplier = 3.5  # Aggressive target for strong setups
+        # Profit target multipliers - REALISTIC TARGETS
+        self.profit_target_multiplier = 2.0      # Target = 2.0x initial risk (more achievable)
+        self.aggressive_target_multiplier = 3.0  # Aggressive target for strong setups
+
+        # NEW: Minimum signal strength for trade entry
+        self.min_signal_strength = 8  # INCREASED from 7 - require stronger signals (out of 12 max)
 
     async def initialize_strategy(self) -> bool:
         """Initialize the strategy for the trading day."""
@@ -708,14 +717,31 @@ class ProprietaryStrategy:
             # MACD divergence detection
             has_divergence, divergence_type = self._detect_macd_divergence(df_with_macd, self.divergence_lookback)
 
+            # NEW: Calculate trend confirmation using EMA
+            ema_20 = df['close'].ewm(span=self.trend_ema_period, adjust=False).mean()
+            current_ema = ema_20.iloc[-1]
+            price_above_ema = current_price > current_ema
+            price_below_ema = current_price < current_ema
+            ema_slope = (ema_20.iloc[-1] - ema_20.iloc[-5]) / 5 if len(ema_20) >= 5 else 0  # EMA slope over 5 bars
+            trend_is_up = ema_slope > 0
+            trend_is_down = ema_slope < 0
+
+            # NEW: Price momentum check (price movement in last 3 bars)
+            price_3_bars_ago = df['close'].iloc[-4] if len(df) >= 4 else current_price
+            recent_price_change = ((current_price - price_3_bars_ago) / price_3_bars_ago) * 100
+            bullish_momentum = recent_price_change > 0.1  # Price up at least 0.1%
+            bearish_momentum = recent_price_change < -0.1  # Price down at least 0.1%
+
             # DETAILED LOGGING
             logger.info(f"📊 {symbol} Analysis @ ${current_price:.2f}")
             logger.info(f"   Gap: {gap_data['gap_percent']:.2f}% ({gap_data['gap_direction']})")
             logger.info(f"   Volume: {volume_ratio:.2f}x (5d: {volume_ratio_5d:.2f}x, 30d: {volume_ratio_30d:.2f}x) - threshold: {self.min_volume_ratio}x")
-            logger.info(f"   RSI: {current_rsi:.1f}")
+            logger.info(f"   RSI: {current_rsi:.1f} (OB: {self.rsi_overbought}, OS: {self.rsi_oversold})")
             logger.info(f"   MACD: {current_macd:.4f}, Signal: {current_signal:.4f}, Histogram: {current_histogram:.4f}")
             logger.info(f"   MACD Bullish Cross: {macd_bullish_cross}, Bearish Cross: {macd_bearish_cross}")
             logger.info(f"   MACD Divergence: {has_divergence} ({divergence_type})")
+            logger.info(f"   Trend: EMA20=${current_ema:.2f}, Price {'ABOVE' if price_above_ema else 'BELOW'} EMA, Slope: {'UP' if trend_is_up else 'DOWN' if trend_is_down else 'FLAT'}")
+            logger.info(f"   Momentum: {recent_price_change:.2f}% ({'BULLISH' if bullish_momentum else 'BEARISH' if bearish_momentum else 'FLAT'})")
 
             # Log to analysis logger for API visibility
             analysis_logger._add_log(
@@ -754,7 +780,7 @@ class ProprietaryStrategy:
                     is_long_valid = False
                     logger.info(f"❌ {symbol} LONG: Volume too low ({volume_ratio:.1f}x < {self.min_volume_ratio}x)")
 
-                # 3. RSI confirmation
+                # 3. RSI confirmation - STRICTER for longs
                 if current_rsi < self.rsi_overbought:
                     setup_reasons.append(f"RSI not overbought: {current_rsi:.1f}")
                     signal_strength += 2
@@ -777,7 +803,7 @@ class ProprietaryStrategy:
                     logger.info(f"✅ {symbol} LONG: MACD bullish divergence detected")
                 elif current_histogram > macd_histogram_threshold:
                     setup_reasons.append(f"MACD bullish (hist={current_histogram:.3f})")
-                    signal_strength += 3  # INCREASED from +1 to +3
+                    signal_strength += 2  # Reduced from 3 - histogram alone is weaker signal
                     macd_confirmed = True
                     logger.info(f"✅ {symbol} LONG: MACD histogram bullish ({current_histogram:.3f})")
 
@@ -785,13 +811,29 @@ class ProprietaryStrategy:
                     is_long_valid = False
                     logger.info(f"❌ {symbol} LONG: No MACD confirmation")
 
-                # Signal strength threshold: 7+ for strong signal
-                # 2 (gap) + 3 (volume) + 2 (RSI) + 3 (MACD) = 10 max
-                if is_long_valid and signal_strength >= 7:
+                # 5. NEW: Trend confirmation - price should be above EMA or EMA rising
+                if self.require_trend_alignment:
+                    if price_above_ema or trend_is_up:
+                        setup_reasons.append(f"Trend aligned: {'Above EMA' if price_above_ema else 'EMA rising'}")
+                        signal_strength += 2  # Bonus for trend alignment
+                        logger.info(f"✅ {symbol} LONG: Trend aligned (Price ${current_price:.2f} vs EMA ${current_ema:.2f})")
+                    else:
+                        is_long_valid = False
+                        logger.info(f"❌ {symbol} LONG: Against trend (Price ${current_price:.2f} < EMA ${current_ema:.2f}, EMA falling)")
+
+                # 6. NEW: Momentum confirmation
+                if bullish_momentum:
+                    setup_reasons.append(f"Bullish momentum: +{recent_price_change:.2f}%")
+                    signal_strength += 1
+                    logger.info(f"✅ {symbol} LONG: Bullish momentum (+{recent_price_change:.2f}%)")
+
+                # Signal strength threshold: INCREASED to 8 for stronger signals
+                # 2 (gap) + 3 (volume) + 2 (RSI) + 2-3 (MACD) + 2 (trend) + 1 (momentum) = 12 max
+                if is_long_valid and signal_strength >= self.min_signal_strength:
                     signal_type = SignalType.LONG
-                    logger.info(f"🎯 {symbol} LONG SIGNAL GENERATED! Strength: {signal_strength}/10")
+                    logger.info(f"🎯 {symbol} LONG SIGNAL GENERATED! Strength: {signal_strength}/12")
                 else:
-                    logger.info(f"⚠️ {symbol} LONG: Signal strength insufficient ({signal_strength} < 7)")
+                    logger.info(f"⚠️ {symbol} LONG: Signal strength insufficient ({signal_strength} < {self.min_signal_strength})")
 
             # SHORT SETUP ANALYSIS - MACD showing bearish momentum
             elif current_histogram < -macd_histogram_threshold:
@@ -811,7 +853,7 @@ class ProprietaryStrategy:
                     is_short_valid = False
                     logger.info(f"❌ {symbol} SHORT: Volume too low ({volume_ratio:.1f}x < {self.min_volume_ratio}x)")
 
-                # 3. RSI confirmation
+                # 3. RSI confirmation - STRICTER for shorts
                 if current_rsi > self.rsi_oversold:
                     setup_reasons.append(f"RSI not oversold: {current_rsi:.1f}")
                     signal_strength += 2
@@ -834,7 +876,7 @@ class ProprietaryStrategy:
                     logger.info(f"✅ {symbol} SHORT: MACD bearish divergence detected")
                 elif current_histogram < -macd_histogram_threshold:
                     setup_reasons.append(f"MACD bearish (hist={current_histogram:.3f})")
-                    signal_strength += 3  # INCREASED from +1 to +3
+                    signal_strength += 2  # Reduced from 3 - histogram alone is weaker signal
                     macd_confirmed = True
                     logger.info(f"✅ {symbol} SHORT: MACD histogram bearish ({current_histogram:.3f})")
 
@@ -842,13 +884,29 @@ class ProprietaryStrategy:
                     is_short_valid = False
                     logger.info(f"❌ {symbol} SHORT: No MACD confirmation")
 
-                # Signal strength threshold: 7+ for strong signal
-                # 2 (gap) + 3 (volume) + 2 (RSI) + 3 (MACD) = 10 max
-                if is_short_valid and signal_strength >= 7:
+                # 5. NEW: Trend confirmation - price should be below EMA or EMA falling
+                if self.require_trend_alignment:
+                    if price_below_ema or trend_is_down:
+                        setup_reasons.append(f"Trend aligned: {'Below EMA' if price_below_ema else 'EMA falling'}")
+                        signal_strength += 2  # Bonus for trend alignment
+                        logger.info(f"✅ {symbol} SHORT: Trend aligned (Price ${current_price:.2f} vs EMA ${current_ema:.2f})")
+                    else:
+                        is_short_valid = False
+                        logger.info(f"❌ {symbol} SHORT: Against trend (Price ${current_price:.2f} > EMA ${current_ema:.2f}, EMA rising)")
+
+                # 6. NEW: Momentum confirmation
+                if bearish_momentum:
+                    setup_reasons.append(f"Bearish momentum: {recent_price_change:.2f}%")
+                    signal_strength += 1
+                    logger.info(f"✅ {symbol} SHORT: Bearish momentum ({recent_price_change:.2f}%)")
+
+                # Signal strength threshold: INCREASED to 8 for stronger signals
+                # 2 (gap) + 3 (volume) + 2 (RSI) + 2-3 (MACD) + 2 (trend) + 1 (momentum) = 12 max
+                if is_short_valid and signal_strength >= self.min_signal_strength:
                     signal_type = SignalType.SHORT
-                    logger.info(f"🎯 {symbol} SHORT SIGNAL GENERATED! Strength: {signal_strength}/10")
+                    logger.info(f"🎯 {symbol} SHORT SIGNAL GENERATED! Strength: {signal_strength}/12")
                 else:
-                    logger.info(f"⚠️ {symbol} SHORT: Signal strength insufficient ({signal_strength} < 7)")
+                    logger.info(f"⚠️ {symbol} SHORT: Signal strength insufficient ({signal_strength} < {self.min_signal_strength})")
 
             # If no valid signal, return None with detailed rejection reasons
             if signal_type == SignalType.NONE:
