@@ -249,10 +249,12 @@ class OrderManagerService:
             logger.info(f"   Monitoring for fill to place trailing stop + take profit...")
 
             # STEP 2: Monitor for fill and place trailing stop + take profit
-            # This will be done asynchronously in a background task
-            import asyncio
-            asyncio.create_task(
-                self._place_trailing_stop_after_fill(
+            # Use threading to reliably monitor in the background (works in both sync/async contexts)
+            import threading
+
+            def monitor_and_place_stops():
+                """Background thread to monitor fill and place stops."""
+                self._sync_place_stops_after_fill(
                     order_id=order.id,
                     symbol=symbol,
                     quantity=quantity,
@@ -261,7 +263,10 @@ class OrderManagerService:
                     take_profit=take_profit,
                     trade_id=trade_id
                 )
-            )
+
+            monitor_thread = threading.Thread(target=monitor_and_place_stops, daemon=True)
+            monitor_thread.start()
+            logger.info(f"   Background monitor started for order {order.id[:8]}...")
 
             # Track the order
             order_data = {
@@ -297,6 +302,130 @@ class OrderManagerService:
             logger.error(f"Full traceback:\n{traceback.format_exc()}")
             return None
 
+    def _sync_place_stops_after_fill(
+        self,
+        order_id: str,
+        symbol: str,
+        quantity: int,
+        side: str,
+        trail_price: float,
+        take_profit: float,
+        trade_id: str = None
+    ):
+        """
+        SYNCHRONOUS version: Monitor entry order for fill, then place trailing stop + FIXED take profit.
+
+        This runs in a background thread and uses time.sleep() for reliable operation.
+
+        Args:
+            order_id: Entry order ID to monitor
+            symbol: Stock symbol
+            quantity: Number of shares
+            side: Entry order side ('buy' or 'sell')
+            trail_price: Dollar amount for trailing stop
+            take_profit: Take profit price (FIXED - does not trail)
+            trade_id: Associated trade ID
+        """
+        import time
+
+        try:
+            logger.info(f"🔍 {symbol}: [Thread] Monitoring order {order_id[:8]} for fill...")
+
+            # Poll order status until filled (max 10 minutes for limit orders)
+            max_checks = 600  # 10 minutes = 600 seconds
+            check_interval = 1  # Check every 1 second
+
+            for i in range(max_checks):
+                try:
+                    order = self.api.get_order(order_id)
+
+                    if order.status == 'filled':
+                        filled_qty = int(order.filled_qty) if order.filled_qty else quantity
+                        filled_price = float(order.filled_avg_price) if order.filled_avg_price else None
+
+                        logger.info(f"✅ {symbol}: Entry order FILLED!")
+                        logger.info(f"   Filled: {filled_qty} shares @ ${filled_price:.2f}" if filled_price else f"   Filled: {filled_qty} shares")
+                        logger.info(f"   Placing trailing stop + FIXED take profit...")
+
+                        # Determine exit side (opposite of entry)
+                        exit_side = 'sell' if side == 'buy' else 'buy'
+
+                        # Place TRAILING STOP
+                        trailing_stop_id = self.place_trailing_stop(
+                            symbol=symbol,
+                            side=exit_side,
+                            quantity=filled_qty,
+                            trail_price=trail_price,
+                            trade_id=trade_id
+                        )
+
+                        if trailing_stop_id:
+                            logger.info(f"✅ {symbol}: Trailing stop placed: {trailing_stop_id} (trail: ${trail_price})")
+                        else:
+                            logger.error(f"❌ {symbol}: Failed to place trailing stop!")
+
+                        # Place FIXED TAKE PROFIT (limit order - does NOT move)
+                        tp_id = self.place_limit_order(
+                            symbol=symbol,
+                            side=exit_side,
+                            quantity=filled_qty,
+                            limit_price=take_profit,
+                            trade_id=trade_id,
+                            time_in_force=TimeInForce.GTC.value  # GTC so it doesn't expire
+                        )
+
+                        if tp_id:
+                            logger.info(f"✅ {symbol}: FIXED Take profit placed: {tp_id} @ ${take_profit:.2f}")
+                        else:
+                            logger.error(f"❌ {symbol}: Failed to place take profit!")
+
+                        # Mark stops as placed in cache
+                        cached_order = redis_cache.get(f"order:{order_id}")
+                        if cached_order:
+                            cached_order['stops_placed'] = True
+                            cached_order['trailing_stop_id'] = trailing_stop_id
+                            cached_order['take_profit_id'] = tp_id
+                            redis_cache.set(f"order:{order_id}", cached_order, expiration=86400)
+
+                        if trailing_stop_id and tp_id:
+                            logger.info(f"🎯 {symbol}: Position FULLY PROTECTED - Trailing Stop + Fixed TP")
+                        else:
+                            logger.warning(f"⚠️ {symbol}: Position partially protected - check orders manually")
+
+                        return
+
+                    elif order.status in ['cancelled', 'expired', 'rejected']:
+                        logger.warning(f"⚠️ {symbol}: Entry order {order.status}, not placing stops")
+                        # Mark as processed so periodic checker doesn't retry
+                        cached_order = redis_cache.get(f"order:{order_id}")
+                        if cached_order:
+                            cached_order['stops_placed'] = True  # Mark as done (no stops needed)
+                            cached_order['entry_failed'] = True
+                            redis_cache.set(f"order:{order_id}", cached_order, expiration=86400)
+                        return
+
+                    elif order.status == 'partially_filled':
+                        # Log partial fill progress
+                        if i % 30 == 0:  # Log every 30 seconds
+                            filled = order.filled_qty if order.filled_qty else 0
+                            logger.info(f"⏳ {symbol}: Partially filled {filled}/{quantity} shares...")
+
+                except Exception as e:
+                    if i % 60 == 0:  # Only log errors every minute to reduce spam
+                        logger.error(f"Error checking order {order_id[:8]} status: {e}")
+
+                # Wait before next check
+                time.sleep(check_interval)
+
+            # Timeout - let periodic checker handle it
+            logger.warning(f"⏰ {symbol}: Entry order not filled after {max_checks} seconds")
+            logger.warning(f"   Will be handled by periodic fill checker")
+
+        except Exception as e:
+            logger.error(f"Error in _sync_place_stops_after_fill for {symbol}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
     async def _place_trailing_stop_after_fill(
         self,
         order_id: str,
@@ -308,35 +437,23 @@ class OrderManagerService:
         trade_id: str = None
     ):
         """
-        Monitor entry order for fill, then immediately place trailing stop + take profit.
-
-        Args:
-            order_id: Entry order ID to monitor
-            symbol: Stock symbol
-            quantity: Number of shares
-            side: Entry order side ('buy' or 'sell')
-            trail_price: Dollar amount for trailing stop
-            take_profit: Take profit price
-            trade_id: Associated trade ID
+        ASYNC version (legacy): Monitor entry order for fill, then place trailing stop + take profit.
+        NOTE: Prefer using _sync_place_stops_after_fill in a thread for reliability.
         """
+        import asyncio
+
         try:
-            import asyncio
+            logger.info(f"🔍 {symbol}: [Async] Monitoring order {order_id} for fill...")
 
-            logger.info(f"🔍 {symbol}: Monitoring order {order_id} for fill...")
-
-            # Poll order status until filled (max 5 minutes for limit orders)
-            max_checks = 300  # 5 minutes = 300 seconds
+            max_checks = 300
             for i in range(max_checks):
                 try:
                     order = self.api.get_order(order_id)
 
                     if order.status == 'filled':
                         logger.info(f"✅ {symbol}: Entry order FILLED! Placing trailing stop + take profit...")
-
-                        # Determine exit side (opposite of entry)
                         exit_side = 'sell' if side == 'buy' else 'buy'
 
-                        # Place TRAILING STOP
                         trailing_stop_id = self.place_trailing_stop(
                             symbol=symbol,
                             side=exit_side,
@@ -350,7 +467,6 @@ class OrderManagerService:
                         else:
                             logger.error(f"❌ {symbol}: Failed to place trailing stop!")
 
-                        # Place TAKE PROFIT
                         tp_id = self.place_limit_order(
                             symbol=symbol,
                             side=exit_side,
@@ -364,7 +480,6 @@ class OrderManagerService:
                         else:
                             logger.error(f"❌ {symbol}: Failed to place take profit!")
 
-                        # Mark stops as placed
                         cached_order = redis_cache.get(f"order:{order_id}")
                         if cached_order:
                             cached_order['stops_placed'] = True
@@ -380,10 +495,9 @@ class OrderManagerService:
                 except Exception as e:
                     logger.error(f"Error checking order status: {e}")
 
-                # Wait 1 second before next check
                 await asyncio.sleep(1)
 
-            logger.warning(f"⏰ {symbol}: Entry order not filled after {max_checks} seconds (will be handled by periodic checker)")
+            logger.warning(f"⏰ {symbol}: Entry order not filled after {max_checks} seconds")
 
         except Exception as e:
             logger.error(f"Error in _place_trailing_stop_after_fill for {symbol}: {e}")
