@@ -127,9 +127,18 @@ class ProprietaryStrategy:
         self.min_gap_percent = 1.0   # INCREASED from 0.75 - require meaningful gaps
         self.max_gap_percent = 15.0  # REDUCED from 20 - avoid extreme gaps (often reversals)
         self.min_volume_ratio = 2.0  # INCREASED from 1.5 - require strong volume confirmation
+
+        # FIXED PERCENTAGE-BASED RISK/REWARD
+        # Stop Loss: 0.4% of entry price
+        # Take Profit: 0.8% of entry price (2:1 reward/risk ratio)
+        self.use_fixed_percentage_stops = True  # Use fixed % instead of ATR
+        self.stop_loss_percent = 0.4   # 0.4% stop loss
+        self.take_profit_percent = 0.8  # 0.8% take profit
+
+        # Legacy ATR-based settings (used if use_fixed_percentage_stops = False)
         self.atr_stop_multiplier = 1.5  # 1.5x ATR for breathing room
-        self.min_stop_distance_dollars = 0.50  # INCREASED from 0.30 - avoid tight stops
-        self.min_stop_distance_percent = 1.5  # INCREASED from 1.2 - ensure meaningful stop distance
+        self.min_stop_distance_dollars = 0.20  # Minimum $0.20 stop distance
+        self.min_stop_distance_percent = 0.4  # Minimum 0.4% stop distance
 
         # RSI thresholds - TIGHTENED for better entries
         self.rsi_overbought = 65  # REDUCED from 70 - more conservative for longs
@@ -966,34 +975,39 @@ class ProprietaryStrategy:
             # Calculate entry levels
             entry_price = current_price
 
-            # Calculate stop loss and target (ATR-based with MINIMUM DISTANCE enforcement)
-            if signal_type == SignalType.LONG:
-                # Calculate ATR-based stop
-                atr_stop_distance = current_atr * self.atr_stop_multiplier
+            # Calculate stop loss and target
+            if self.use_fixed_percentage_stops:
+                # FIXED PERCENTAGE-BASED: 0.4% stop loss, 0.8% take profit
+                stop_distance = entry_price * (self.stop_loss_percent / 100.0)
+                profit_distance = entry_price * (self.take_profit_percent / 100.0)
 
-                # Calculate minimum stop distance (greater of $0.30 or 1.2% of price)
-                min_stop_dollar = self.min_stop_distance_dollars
-                min_stop_percent = entry_price * (self.min_stop_distance_percent / 100.0)
-                min_stop_distance = max(min_stop_dollar, min_stop_percent)
+                if signal_type == SignalType.LONG:
+                    stop_loss = entry_price - stop_distance
+                    target_price = entry_price + profit_distance
+                else:  # SHORT
+                    stop_loss = entry_price + stop_distance
+                    target_price = entry_price - profit_distance
 
-                # Use the LARGER of ATR-based or minimum stop distance
-                final_stop_distance = max(atr_stop_distance, min_stop_distance)
-                stop_loss = entry_price - final_stop_distance
-                target_price = entry_price + (final_stop_distance * 2.5)  # 2.5x risk for reward
+                logger.info(f"   📊 Fixed %: Stop={self.stop_loss_percent}% (${stop_distance:.2f}), TP={self.take_profit_percent}% (${profit_distance:.2f})")
 
-            else:  # SHORT
-                # Calculate ATR-based stop
-                atr_stop_distance = current_atr * self.atr_stop_multiplier
-
-                # Calculate minimum stop distance (greater of $0.30 or 1.2% of price)
-                min_stop_dollar = self.min_stop_distance_dollars
-                min_stop_percent = entry_price * (self.min_stop_distance_percent / 100.0)
-                min_stop_distance = max(min_stop_dollar, min_stop_percent)
-
-                # Use the LARGER of ATR-based or minimum stop distance
-                final_stop_distance = max(atr_stop_distance, min_stop_distance)
-                stop_loss = entry_price + final_stop_distance
-                target_price = entry_price - (final_stop_distance * 2.5)
+            else:
+                # Legacy ATR-based calculation
+                if signal_type == SignalType.LONG:
+                    atr_stop_distance = current_atr * self.atr_stop_multiplier
+                    min_stop_dollar = self.min_stop_distance_dollars
+                    min_stop_percent = entry_price * (self.min_stop_distance_percent / 100.0)
+                    min_stop_distance = max(min_stop_dollar, min_stop_percent)
+                    final_stop_distance = max(atr_stop_distance, min_stop_distance)
+                    stop_loss = entry_price - final_stop_distance
+                    target_price = entry_price + (final_stop_distance * self.profit_target_multiplier)
+                else:  # SHORT
+                    atr_stop_distance = current_atr * self.atr_stop_multiplier
+                    min_stop_dollar = self.min_stop_distance_dollars
+                    min_stop_percent = entry_price * (self.min_stop_distance_percent / 100.0)
+                    min_stop_distance = max(min_stop_dollar, min_stop_percent)
+                    final_stop_distance = max(atr_stop_distance, min_stop_distance)
+                    stop_loss = entry_price + final_stop_distance
+                    target_price = entry_price - (final_stop_distance * self.profit_target_multiplier)
 
             # Validate levels
             if signal_type == SignalType.LONG:
@@ -1490,23 +1504,28 @@ class ProprietaryStrategy:
                         unrealized_pl = float(alpaca_pos.get('unrealized_pl', 0))
                         side = alpaca_pos.get('side', 'long')
 
-                        # Calculate ATR-based stops (fallback if we don't have original)
-                        df = market_data_service.get_bars(symbol, timeframe='5Min', limit=100)
-                        if df is not None and len(df) > 0:
-                            atr = self.indicators.calculate_atr(df, period=14)
-                            current_atr = atr.iloc[-1] if not atr.empty else (entry_price * 0.02)
+                        # Calculate stops using fixed percentage (0.4% stop, 0.8% target)
+                        if self.use_fixed_percentage_stops:
+                            stop_distance = entry_price * (self.stop_loss_percent / 100.0)
+                            profit_distance = entry_price * (self.take_profit_percent / 100.0)
                         else:
-                            current_atr = entry_price * 0.02  # 2% fallback
-
-                        stop_distance = max(current_atr * self.atr_stop_multiplier, 0.30, entry_price * 0.012)
+                            # Legacy ATR-based calculation
+                            df = market_data_service.get_bars(symbol, timeframe='5Min', limit=100)
+                            if df is not None and len(df) > 0:
+                                atr = self.indicators.calculate_atr(df, period=14)
+                                current_atr = atr.iloc[-1] if not atr.empty else (entry_price * 0.02)
+                            else:
+                                current_atr = entry_price * 0.02  # 2% fallback
+                            stop_distance = max(current_atr * self.atr_stop_multiplier, 0.20, entry_price * 0.004)
+                            profit_distance = stop_distance * self.profit_target_multiplier
 
                         if side == 'long':
                             stop_loss = entry_price - stop_distance
-                            target_price = entry_price + (stop_distance * 2.5)
+                            target_price = entry_price + profit_distance
                             signal_type = SignalType.LONG
                         else:
                             stop_loss = entry_price + stop_distance
-                            target_price = entry_price - (stop_distance * 2.5)
+                            target_price = entry_price - profit_distance
                             signal_type = SignalType.SHORT
 
                         # Create minimal TradeSetup

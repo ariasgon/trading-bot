@@ -1,9 +1,11 @@
 """
 Redis cache connection and utilities.
+Falls back to in-memory cache if Redis is unavailable.
 """
 import redis
 import json
 import logging
+import time
 from typing import Any, Optional, Union
 from datetime import timedelta
 
@@ -12,15 +14,60 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 
 
+class InMemoryCache:
+    """Simple in-memory cache fallback when Redis is unavailable."""
+
+    def __init__(self):
+        self._cache = {}
+        self._expiry = {}
+
+    def set(self, key: str, value: str, ex: int = None) -> bool:
+        self._cache[key] = value
+        if ex:
+            self._expiry[key] = time.time() + ex
+        return True
+
+    def setex(self, key: str, seconds: int, value: str) -> bool:
+        self._cache[key] = value
+        self._expiry[key] = time.time() + seconds
+        return True
+
+    def get(self, key: str) -> Optional[str]:
+        # Check expiry
+        if key in self._expiry and time.time() > self._expiry[key]:
+            del self._cache[key]
+            del self._expiry[key]
+            return None
+        return self._cache.get(key)
+
+    def delete(self, key: str) -> int:
+        if key in self._cache:
+            del self._cache[key]
+            self._expiry.pop(key, None)
+            return 1
+        return 0
+
+    def exists(self, key: str) -> int:
+        if key in self._expiry and time.time() > self._expiry[key]:
+            del self._cache[key]
+            del self._expiry[key]
+            return 0
+        return 1 if key in self._cache else 0
+
+    def ping(self) -> bool:
+        return True
+
+
 class RedisCache:
-    """Redis cache wrapper with JSON serialization."""
-    
+    """Redis cache wrapper with JSON serialization. Falls back to in-memory if Redis unavailable."""
+
     def __init__(self):
         self.redis_client = None
+        self.using_fallback = False
         self.connect()
-    
+
     def connect(self):
-        """Establish Redis connection."""
+        """Establish Redis connection, fall back to in-memory if unavailable."""
         try:
             self.redis_client = redis.from_url(
                 settings.redis_url,
@@ -31,11 +78,12 @@ class RedisCache:
             )
             # Test connection
             self.redis_client.ping()
+            self.using_fallback = False
             logger.info("Redis connection established successfully")
         except Exception as e:
-            logger.error(f"Failed to connect to Redis: {e}")
-            self.redis_client = None
-            raise
+            logger.warning(f"Redis unavailable ({e}), using in-memory cache fallback")
+            self.redis_client = InMemoryCache()
+            self.using_fallback = True
     
     def set(self, key: str, value: Any, expiration: Optional[Union[int, timedelta]] = None) -> bool:
         """Set a value in Redis with optional expiration."""
@@ -127,6 +175,10 @@ class RedisCache:
             return False
         except Exception:
             return False
+
+    def is_using_fallback(self) -> bool:
+        """Check if using in-memory fallback instead of Redis."""
+        return self.using_fallback
 
 
 # Create global Redis cache instance
