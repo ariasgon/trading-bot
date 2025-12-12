@@ -8,6 +8,7 @@ from decimal import Decimal
 
 from app.core.config import settings
 from app.core.database import get_db_session
+from app.core.trade_filters import MAX_RISK_PER_TRADE_DOLLARS, MAX_OPEN_POSITIONS, DAILY_MAX_LOSS_DOLLARS, DAILY_MAX_LOSS_PERCENT
 from app.models.trade import Trade, TradeStatus
 from app.models.position import Position, PositionStatus
 from app.services.order_manager import order_manager
@@ -18,38 +19,47 @@ logger = logging.getLogger(__name__)
 
 class RiskManagerService:
     """Service for managing trading risk and position sizing."""
-    
+
     def __init__(self):
-        self.max_risk_per_trade = settings.max_risk_per_trade
-        self.daily_loss_limit = settings.daily_loss_limit
-        self.max_concurrent_positions = settings.max_concurrent_positions
+        # Use centralized trade filter settings (MAX_RISK_PER_TRADE_DOLLARS = $100)
+        self.max_risk_per_trade_dollars = MAX_RISK_PER_TRADE_DOLLARS  # $100 max risk per trade
+        self.max_risk_per_trade = settings.max_risk_per_trade  # Percentage-based (fallback)
+        self.daily_loss_limit = DAILY_MAX_LOSS_PERCENT  # 2% or $500
+        self.daily_loss_limit_dollars = DAILY_MAX_LOSS_DOLLARS  # $500 max daily loss
+        self.max_concurrent_positions = MAX_OPEN_POSITIONS  # 10 max open positions
         
-    def calculate_position_size(self, symbol: str, entry_price: float, stop_loss: float, 
+    def calculate_position_size(self, symbol: str, entry_price: float, stop_loss: float,
                               risk_percentage: float = None) -> Tuple[int, Dict[str, Any]]:
-        """Calculate optimal position size based on risk management rules."""
+        """
+        Calculate optimal position size based on risk management rules.
+
+        POSITION SIZING FORMULA:
+        - Max risk per trade: $100 (fixed dollar amount)
+        - Shares = $100 / (entry_price - stop_loss)
+        - This ensures consistent risk regardless of stock price
+        """
         try:
-            # Use default risk percentage if not provided
-            if risk_percentage is None:
-                risk_percentage = self.max_risk_per_trade
-            
             # Get account information
             account_info = order_manager.get_account_info()
-            account_equity = account_info.get('equity', 0)
-            
+            account_equity = float(account_info.get('equity', 0))
+
             if account_equity <= 0:
                 return 0, {"error": "Invalid account equity"}
-            
-            # Calculate dollar risk amount
-            risk_amount = account_equity * risk_percentage
-            
+
+            # PRIMARY: Use fixed dollar risk ($100 max per trade)
+            # This is the centralized setting from trade_filters
+            risk_amount = self.max_risk_per_trade_dollars  # $100
+
             # Calculate risk per share
             risk_per_share = abs(entry_price - stop_loss)
-            
+
             if risk_per_share <= 0:
                 return 0, {"error": "Invalid risk per share calculation"}
-            
-            # Calculate base position size
+
+            # Calculate base position size based on $100 max risk
             base_shares = int(risk_amount / risk_per_share)
+
+            logger.info(f"POSITION SIZE: {symbol} - ${risk_amount} max risk / ${risk_per_share:.2f} per share = {base_shares} shares")
             
             # Apply position sizing filters
             sizing_info = self._apply_sizing_filters(

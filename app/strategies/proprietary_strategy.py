@@ -70,6 +70,7 @@ from app.services.risk_manager import risk_manager
 from app.services.portfolio import portfolio_service
 from app.core.cache import redis_cache
 from app.core.database import get_db_session
+from app.core.trade_filters import trade_filters, MAX_RISK_PER_TRADE_DOLLARS, MAX_OPEN_POSITIONS, MAX_TRADES_PER_DAY
 from app.models.trade import Trade, TradeStatus
 from app.models.position import Position, PositionStatus
 
@@ -478,8 +479,27 @@ class ProprietaryStrategy:
         if not self._check_time_restriction():
             return setups
 
+        # Check circuit breaker FIRST - if active, don't scan at all
+        if trade_filters.check_circuit_breaker():
+            logger.warning("Circuit breaker active - skipping opportunity scan")
+            return setups
+
+        # Sort symbols by priority (leveraged ETFs first, then liquid tech)
+        symbols = trade_filters.sort_by_priority(symbols)
+        logger.info(f"Scanning {len(symbols)} symbols (sorted by priority)")
+
         for symbol in symbols:
             try:
+                # BLACKLIST CHECK: Skip blacklisted tickers (crypto miners)
+                if trade_filters.is_blacklisted(symbol):
+                    logger.debug(f"⛔ {symbol} is blacklisted - skipping")
+                    continue
+
+                # ONE-STRIKE RULE: Skip tickers that already hit max losses today
+                if trade_filters.is_ticker_blocked_by_losses(symbol):
+                    logger.debug(f"⛔ {symbol} blocked by one-strike rule - skipping")
+                    continue
+
                 # WHIPSAW PREVENTION: Check cooldown after stop out
                 if symbol in self.recent_stop_outs:
                     time_since_stop = time_module.time() - self.recent_stop_outs[symbol]
@@ -1133,6 +1153,29 @@ class ProprietaryStrategy:
         try:
             setup: TradeSetup = signal['setup']
 
+            # Get account info for position sizing
+            account_info = order_manager.get_account_info()
+            account_equity = float(account_info.get('equity', 100000))
+
+            # Get current position count
+            current_positions = len(self.active_positions)
+
+            # COMPREHENSIVE TRADE FILTER CHECK
+            trade_direction = "long" if setup.signal_type == SignalType.LONG else "short"
+            can_trade, rejection_reasons = trade_filters.can_take_trade(
+                symbol=setup.symbol,
+                trade_direction=trade_direction,
+                account_equity=account_equity,
+                current_positions=current_positions
+            )
+
+            if not can_trade:
+                rejection_msg = f"REJECTED [{trade_direction.upper()}] - {'; '.join(rejection_reasons)}"
+                logger.warning(f"❌ {setup.symbol}: {rejection_msg}")
+                analysis_logger._add_log('warning', rejection_msg, setup.symbol, analysis_logger._get_trading_time())
+                self.active_setups.pop(setup.symbol, None)
+                return None
+
             # DUPLICATE ORDER PREVENTION: Check if we already have a pending order for this symbol
             if setup.symbol in self.pending_order_symbols:
                 pending_time = self.pending_order_symbols[setup.symbol]
@@ -1243,6 +1286,9 @@ class ProprietaryStrategy:
 
                 # Track pending order to prevent duplicates
                 self.pending_order_symbols[setup.symbol] = time_module.time()
+
+                # INCREMENT TRADE COUNT for daily limit tracking
+                trade_filters.increment_trade_count()
 
                 logger.info(f"✅ TRADE PLACED: {setup.symbol} {side} {setup.position_size} shares")
                 logger.info(f"   Entry Order ID: {order_id}")
@@ -1390,6 +1436,20 @@ class ProprietaryStrategy:
             True if successfully closed, False otherwise
         """
         try:
+            setup: TradeSetup = position_data['setup']
+
+            # Get current price for P/L calculation
+            current_price = market_data_service.get_current_price(symbol)
+            entry_price = setup.entry_price
+
+            # Calculate P/L
+            if setup.signal_type == SignalType.LONG:
+                pnl = (current_price - entry_price) * setup.position_size
+            else:
+                pnl = (entry_price - current_price) * setup.position_size
+
+            is_loss = pnl < 0
+
             # Track stop out if this is a stop loss trigger
             if "stop" in reason.lower():
                 self._track_stop_out(symbol)
@@ -1397,9 +1457,26 @@ class ProprietaryStrategy:
             # Track ALL trade exits to prevent churning
             self._track_trade_exit(symbol, reason)
 
-            setup: TradeSetup = position_data['setup']
+            # UPDATE TRADE FILTERS: Track win/loss for one-strike rule and circuit breaker
+            trade_filters.update_daily_pnl(pnl, is_win=not is_loss, symbol=symbol)
 
-            logger.info(f"⏰ {symbol}: FORCE CLOSING POSITION - {reason}")
+            # Log the trade with enhanced details
+            trade_direction = "long" if setup.signal_type == SignalType.LONG else "short"
+            trade_filters.log_trade({
+                'symbol': symbol,
+                'direction': trade_direction,
+                'entry_price': entry_price,
+                'exit_price': current_price,
+                'stop_loss': setup.stop_loss,
+                'take_profit': setup.target_price,
+                'quantity': setup.position_size,
+                'pnl': pnl,
+                'entry_time': position_data.get('entry_time'),
+                'exit_time': datetime.now(pytz.timezone('US/Eastern')),
+                'exit_reason': reason
+            })
+
+            logger.info(f"⏰ {symbol}: FORCE CLOSING POSITION - {reason} | P/L: ${pnl:+.2f}")
             logger.info(f"   Position size: {setup.position_size} shares")
             logger.info(f"   Entry: ${setup.entry_price:.2f}")
 

@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 
 from app.core.config import settings
 from app.core.cache import redis_cache
+from app.core.trade_filters import trade_filters, BLACKLIST, PRIORITY_TICKERS, MAX_TRADES_PER_DAY, MAX_OPEN_POSITIONS
 from app.services.market_data import market_data_service
 from app.services.order_manager import order_manager
 from app.services.portfolio import portfolio_service
@@ -45,8 +46,8 @@ class TradingBotEngine:
         self.session_start_time = None
         self.last_scan_time = None
         self.trades_today = 0
-        self.base_max_trades_per_day = 10  # Base limit when PnL is neutral/negative
-        self.max_trades_when_profitable = 20  # Increased limit when daily PnL is positive
+        self.base_max_trades_per_day = MAX_TRADES_PER_DAY  # Use centralized limit (25)
+        self.max_trades_when_profitable = MAX_TRADES_PER_DAY  # Same limit regardless of P/L
 
         # Error tracking
         self.error_count = 0
@@ -129,6 +130,9 @@ class TradingBotEngine:
             else:
                 logger.info(f"✅ {self.strategy_name.upper()} strategy initialized and activated")
 
+            # Reload existing open positions
+            await self._reload_existing_positions()
+
         except Exception as e:
             logger.error(f"Service initialization failed: {e}")
             raise
@@ -137,13 +141,22 @@ class TradingBotEngine:
         """Initialize stock analysis watchlist using dynamic market scanner."""
         try:
             logger.info("🔍 DYNAMIC SCANNER: Building initial watchlist from S&P 500 + NASDAQ...")
-            
+
             # Use the dynamic market scanner to build watchlist
-            self.current_watchlist = await portfolio_service.get_watchlist()
-            
-            if self.current_watchlist and len(self.current_watchlist) > 0:
+            raw_watchlist = await portfolio_service.get_watchlist()
+
+            if raw_watchlist and len(raw_watchlist) > 0:
+                # FILTER: Remove blacklisted tickers (crypto miners)
+                filtered_watchlist = [s for s in raw_watchlist if not trade_filters.is_blacklisted(s)]
+                removed_count = len(raw_watchlist) - len(filtered_watchlist)
+                if removed_count > 0:
+                    logger.info(f"🚫 Filtered out {removed_count} blacklisted ticker(s)")
+
+                # SORT: Priority tickers first (leveraged ETFs, then liquid tech)
+                self.current_watchlist = trade_filters.sort_by_priority(filtered_watchlist)
+
                 logger.info(f"✅ INITIAL WATCHLIST: {len(self.current_watchlist)} gappers found")
-                logger.info(f"📊 TOP SYMBOLS: {', '.join(self.current_watchlist[:5])}")
+                logger.info(f"📊 TOP SYMBOLS (sorted by priority): {', '.join(self.current_watchlist[:5])}")
                 
                 # Log to analysis log for visibility
                 self.add_analysis_log(f"Dynamic scanner initialized: {len(self.current_watchlist)} gappers found", "success")
@@ -160,14 +173,22 @@ class TradingBotEngine:
                 
         except Exception as e:
             logger.error(f"Error initializing watchlist: {e}")
-            # Use fallback list if scanner fails
-            # Expanded fallback watchlist (30 stocks)
-            self.current_watchlist = [
-                "AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "META", "NVDA", "NFLX", "AMD", "CRM",
-                "COIN", "RBLX", "HOOD", "SOFI", "SHOP", "SQ", "UBER",
-                "MRNA", "BNTX", "PFE", "JPM", "BAC", "GS",
-                "MARA", "RIOT", "SOXL", "TQQQ", "SPXL", "SPY", "QQQ"
+            # Use fallback list if scanner fails - NOTE: No blacklisted tickers here!
+            # Priority order: Leveraged ETFs first, then liquid tech, then others
+            fallback = [
+                # Tier 1: Leveraged ETFs (highest priority)
+                "SQQQ", "TQQQ", "SOXL", "SOXS", "SPXU", "SPXL", "UVXY", "TNA", "TZA",
+                # Tier 2: Liquid tech
+                "AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "META", "NVDA", "AMD",
+                # Tier 3: Other liquid stocks
+                "NFLX", "CRM", "COIN", "RBLX", "HOOD", "SOFI", "SHOP", "SQ", "UBER",
+                # Removed: MARA, RIOT (blacklisted crypto miners)
+                "SPY", "QQQ"
             ]
+            # Filter and sort
+            self.current_watchlist = trade_filters.sort_by_priority(
+                [s for s in fallback if not trade_filters.is_blacklisted(s)]
+            )
             self.add_analysis_log(f"Watchlist scanner error, using fallback: {e}", "error")
     
     def _schedule_tasks(self):
@@ -213,6 +234,14 @@ class TradingBotEngine:
                 except Exception as monitor_error:
                     logger.error(f"Position monitoring error: {monitor_error}")
 
+                # Periodic fill checker - ensures all filled orders have stops
+                try:
+                    await asyncio.wait_for(order_manager.check_and_place_missing_stops(), timeout=30)
+                except asyncio.TimeoutError:
+                    logger.warning("Fill checker timeout - continuing")
+                except Exception as checker_error:
+                    logger.error(f"Fill checker error: {checker_error}")
+
                 # Pause between analysis cycles - run every minute
                 await asyncio.sleep(60)  # 60-second cycle (1 minute) for trade analysis
                 
@@ -238,13 +267,19 @@ class TradingBotEngine:
 
             if not self.current_watchlist or len(self.current_watchlist) == 0:
                 logger.warning("⚠️ Market scanner found no gappers, using fallback list")
-                # Expanded fallback watchlist (30 stocks)
-            self.current_watchlist = [
-                "AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "META", "NVDA", "NFLX", "AMD", "CRM",
-                "COIN", "RBLX", "HOOD", "SOFI", "SHOP", "SQ", "UBER",
-                "MRNA", "BNTX", "PFE", "JPM", "BAC", "GS",
-                "MARA", "RIOT", "SOXL", "TQQQ", "SPXL", "SPY", "QQQ"
-            ]
+                # Fallback watchlist - no blacklisted tickers, sorted by priority
+                fallback = [
+                    # Tier 1: Leveraged ETFs
+                    "SQQQ", "TQQQ", "SOXL", "SOXS", "SPXU", "SPXL", "UVXY", "TNA", "TZA",
+                    # Tier 2: Liquid tech
+                    "AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "META", "NVDA", "AMD",
+                    # Tier 3: Others
+                    "NFLX", "CRM", "MRNA", "BNTX", "PFE", "JPM", "BAC", "GS",
+                    "SPY", "QQQ"
+                ]
+                self.current_watchlist = trade_filters.sort_by_priority(
+                    [s for s in fallback if not trade_filters.is_blacklisted(s)]
+                )
 
             # Cache watchlist
             redis_cache.set("daily_watchlist", self.current_watchlist, expiration=28800)  # 8 hours
@@ -266,14 +301,19 @@ class TradingBotEngine:
             logger.error(f"Pre-market scan failed: {e}")
             import traceback
             logger.error(f"Traceback: {traceback.format_exc()}")
-            # Use fallback watchlist on failure
-            # Expanded fallback watchlist (30 stocks)
-            self.current_watchlist = [
-                "AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "META", "NVDA", "NFLX", "AMD", "CRM",
-                "COIN", "RBLX", "HOOD", "SOFI", "SHOP", "SQ", "UBER",
-                "MRNA", "BNTX", "PFE", "JPM", "BAC", "GS",
-                "MARA", "RIOT", "SOXL", "TQQQ", "SPXL", "SPY", "QQQ"
+            # Use fallback watchlist on failure - no blacklisted tickers
+            fallback = [
+                # Tier 1: Leveraged ETFs
+                "SQQQ", "TQQQ", "SOXL", "SOXS", "SPXU", "SPXL", "UVXY", "TNA", "TZA",
+                # Tier 2: Liquid tech
+                "AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "META", "NVDA", "AMD",
+                # Tier 3: Others
+                "NFLX", "CRM", "MRNA", "BNTX", "PFE", "JPM", "BAC", "GS",
+                "SPY", "QQQ"
             ]
+            self.current_watchlist = trade_filters.sort_by_priority(
+                [s for s in fallback if not trade_filters.is_blacklisted(s)]
+            )
     
     async def _smart_premarket_scan(self):
         """Smart pre-market scan with time validation."""
@@ -373,23 +413,30 @@ class TradingBotEngine:
         """Start the trading session."""
         try:
             logger.info("🔔 Starting trading session...")
-            
+
             # Check if market is actually open
             market_status = market_data_service.get_market_status()
             if not market_status.get('is_open', False):
                 logger.warning("Market is not open. Skipping trading session.")
                 return
-            
+
             # Initialize trading state
             self.is_trading_active = True
             self.session_start_time = datetime.now()
             self.trades_today = 0
             self.error_count = 0
-            
+
+            # RESET TRADE FILTERS for new trading day
+            trade_filters.reset_daily_state()
+            logger.info("✅ Trade filters reset for new trading day")
+            logger.info(f"   Blacklisted tickers: {BLACKLIST}")
+            logger.info(f"   Priority tier 1 (leveraged ETFs): {PRIORITY_TICKERS['tier_1']}")
+            logger.info(f"   Max trades/day: {MAX_TRADES_PER_DAY}, Max open positions: {MAX_OPEN_POSITIONS}")
+
             # Reset daily risk counters
             redis_cache.set("daily_pnl", 0.0)
             redis_cache.set("consecutive_losses", 0)
-            
+
             logger.info(f"✅ Trading session started. Watchlist: {len(self.current_watchlist)} symbols")
             
         except Exception as e:
@@ -451,30 +498,36 @@ class TradingBotEngine:
         try:
             # Check risk limits
             account_info = order_manager.get_account_info()
-            account_equity = account_info.get('equity', 100000)
-            
-            # Check daily loss limit
-            if risk_manager.is_daily_loss_limit_reached():
+            account_equity = float(account_info.get('equity', 100000))
+
+            # CHECK CIRCUIT BREAKER - if triggered by consecutive losses, pause trading
+            if trade_filters.check_circuit_breaker():
+                self.add_analysis_log("Circuit breaker active - trading paused due to consecutive losses", "warning")
+                logger.warning("Circuit breaker active - trading paused")
+                return
+
+            # Check daily loss limit using trade_filters (NET P/L based)
+            if trade_filters.check_daily_loss_limit(account_equity):
                 self.add_analysis_log("Daily loss limit reached - trading stopped", "warning")
-                logger.warning("Daily loss limit reached. Stopping trading.")
+                logger.warning("Daily NET P/L loss limit reached. Stopping trading.")
                 self.is_trading_active = False
                 return
-            
-            # Don't trade if we've hit daily trade limit (dynamic based on PnL)
-            max_trades_today = self.get_dynamic_trade_limit()
-            if self.trades_today >= max_trades_today:
-                self.add_analysis_log(f"Daily trade limit reached ({self.trades_today}/{max_trades_today} trades)", "info")
-                logger.info(f"Daily trade limit reached ({self.trades_today}/{max_trades_today})")
+
+            # Check daily trade limit
+            if trade_filters.check_daily_trade_limit():
+                self.add_analysis_log(f"Daily trade limit reached ({MAX_TRADES_PER_DAY} trades)", "info")
+                logger.info(f"Daily trade limit reached ({MAX_TRADES_PER_DAY})")
                 return
             
             # STEP 1: Find new gap setups from watchlist (this was missing!)
             if self.current_watchlist:
                 self.add_analysis_log(f"Scanning {len(self.current_watchlist)} symbols for entry signals...", "info")
-                
+                logger.info(f"🔍 Trading cycle: Analyzing {len(self.current_watchlist)} watchlist symbols")
+
                 # First, analyze watchlist for new gap setups
                 await self._analyze_watchlist_for_setups()
-                
-                # Then, monitor existing setups for entry signals  
+
+                # Then, monitor existing setups for entry signals
                 signals = await self.active_strategy.monitor_active_setups()
                 
                 # Execute best signals if available (process up to 3 per cycle)
@@ -571,9 +624,9 @@ class TradingBotEngine:
     async def _monitor_positions(self):
         """Monitor and manage active positions."""
         try:
-            if not self.active_positions:
-                return
-            
+            # ALWAYS call strategy monitoring - it syncs from Alpaca if needed
+            # Don't check self.active_positions here - strategy has its own tracking
+
             # Use proprietary strategy position management
             actions = await self.active_strategy.monitor_positions()
             
@@ -645,15 +698,105 @@ class TradingBotEngine:
         """Emergency closure of all positions."""
         try:
             logger.warning("🚨 Emergency position closure initiated...")
-            
+
             await self._close_all_positions()
             await self._cancel_all_orders()
-            
+
             logger.info("✅ Emergency closure complete")
-            
+
         except Exception as e:
             logger.error(f"Emergency closure error: {e}")
-    
+
+    async def _reload_existing_positions(self):
+        """Reload existing open positions into tracking when bot restarts."""
+        try:
+            logger.info("🔄 Checking for existing open positions to track...")
+
+            # Get open positions from Alpaca
+            open_positions = portfolio_service.get_open_positions()
+
+            if not open_positions or len(open_positions) == 0:
+                logger.info("✅ No existing positions to reload")
+                return
+
+            logger.info(f"📊 Found {len(open_positions)} existing position(s), reloading into tracking...")
+
+            from app.core.database import get_db_session
+            from app.models.models import Trade, Position
+            from app.strategies.proprietary_strategy import TradeSetup, SignalType
+            from sqlalchemy import select
+
+            reloaded_count = 0
+
+            for pos in open_positions:
+                try:
+                    symbol = pos['symbol']
+                    quantity = abs(pos['quantity'])
+                    entry_price = pos['entry_price']
+                    side = 'long' if pos['quantity'] > 0 else 'short'
+
+                    logger.info(f"   Reloading {symbol}: {side} {quantity} shares @ ${entry_price:.2f}")
+
+                    # Try to get trade details from database
+                    # Look for trades that are not yet closed (exit_time is None)
+                    with get_db_session() as db:
+                        db_trade = db.query(Trade).filter(
+                            Trade.symbol == symbol,
+                            Trade.exit_time.is_(None)  # Still open - no exit time recorded
+                        ).order_by(Trade.entry_time.desc()).first()  # Get most recent if multiple
+
+                    if db_trade:
+                        # Create TradeSetup from database record
+                        setup = TradeSetup(
+                            symbol=symbol,
+                            signal_type=SignalType.LONG if side == 'long' else SignalType.SHORT,
+                            entry_price=entry_price,
+                            stop_loss=db_trade.stop_loss or (entry_price * 0.98 if side == 'long' else entry_price * 1.02),
+                            target_price=db_trade.target_price or (entry_price * 1.05 if side == 'long' else entry_price * 0.95),
+                            position_size=quantity,
+                            setup_type=db_trade.setup_type or 'gap_up' if side == 'long' else 'gap_down',
+                            signal_strength=7,
+                            entry_reasons=["Position reloaded from database"]
+                        )
+
+                        # Add to bot's active_positions
+                        self.active_positions[symbol] = {
+                            'symbol': symbol,
+                            'quantity': quantity,
+                            'side': side,
+                            'entry_price': entry_price,
+                            'entry_time': db_trade.entry_time or datetime.now()
+                        }
+
+                        # Add to strategy's active_positions for trailing stop management
+                        self.active_strategy.active_positions[symbol] = {
+                            'setup': setup,
+                            'trade_id': db_trade.id,
+                            'order_id': db_trade.alpaca_order_id,
+                            'entry_time': db_trade.entry_time or datetime.now(),
+                            'has_trailing_stop': False,  # Will be evaluated in monitor_positions
+                            'locked_profit': 0.0
+                        }
+
+                        reloaded_count += 1
+                        logger.info(f"   ✅ {symbol} reloaded and tracking enabled")
+                    else:
+                        logger.warning(f"   ⚠️ {symbol}: No database record found, skipping tracking")
+
+                except Exception as e:
+                    logger.error(f"   ❌ Error reloading {symbol}: {e}")
+                    continue
+
+            if reloaded_count > 0:
+                logger.info(f"✅ Successfully reloaded {reloaded_count} position(s) for tracking and trailing stops")
+            else:
+                logger.warning("⚠️ Could not reload any positions (no database records found)")
+
+        except Exception as e:
+            logger.error(f"Error reloading existing positions: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
     async def _update_daily_stats(self):
         """Update daily statistics."""
         try:
