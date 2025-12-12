@@ -129,11 +129,11 @@ class ProprietaryStrategy:
         self.min_volume_ratio = 2.0  # INCREASED from 1.5 - require strong volume confirmation
 
         # FIXED PERCENTAGE-BASED RISK/REWARD
-        # Stop Loss: 0.4% of entry price
-        # Take Profit: 0.8% of entry price (2:1 reward/risk ratio)
+        # Stop Loss: 0.8% of entry price
+        # Take Profit: 1.6% of entry price (2:1 reward/risk ratio)
         self.use_fixed_percentage_stops = True  # Use fixed % instead of ATR
-        self.stop_loss_percent = 0.4   # 0.4% stop loss
-        self.take_profit_percent = 0.8  # 0.8% take profit
+        self.stop_loss_percent = 0.8   # 0.8% stop loss - wider to handle normal volatility
+        self.take_profit_percent = 1.6  # 1.6% take profit
 
         # Legacy ATR-based settings (used if use_fixed_percentage_stops = False)
         self.atr_stop_multiplier = 1.5  # 1.5x ATR for breathing room
